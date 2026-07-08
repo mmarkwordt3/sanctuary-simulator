@@ -1,0 +1,500 @@
+/* Sanctuary — restrained medieval-fortress theme. Board via CSS Grid. */
+
+:root {
+  --stone-900: #1c1a17;
+  --stone-800: #262320;
+  --stone-700: #322e29;
+  --stone-600: #45403a;
+  --stone-500: #5c554d;
+  --stone-400: #7a7368;
+  --parchment: #ece3d2;
+  --parchment-dim: #cdc3ae;
+
+  --board-line: #3a352f;
+  --square-light: #d9cdb4;
+  --square-dark: #cbbd9f;
+
+  --wall: #6d6862;
+  --inner: #f2ead6;
+  --flag-tile: #cf8b46;
+  --cannon-west: #8d7bb0;
+  --cannon-east: #9c86bd;
+  --gate-open: #cda86a;
+  --gate-closed: #4a423a;
+  --reserved: #b9ad8f;
+
+  --green: #5b7d55;
+  --green-dark: #3f5c3b;
+  --blue: #4f6d93;
+  --blue-dark: #38506e;
+
+  --legal-move: rgba(90, 150, 90, 0.55);
+  --legal-capture: #b5462f;
+
+  --focus: #e0b354;
+
+  color-scheme: dark;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 50% -10%, #2c2822, var(--stone-900) 60%);
+  color: var(--parchment);
+  min-height: 100vh;
+}
+
+.app-header {
+  padding: 1rem 1.5rem 0.25rem;
+  text-align: center;
+}
+.app-header h1 {
+  margin: 0;
+  font-size: 1.9rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--parchment);
+  text-shadow: 0 2px 0 rgba(0, 0, 0, 0.4);
+}
+.tagline {
+  margin: 0.15rem 0 0;
+  color: var(--parchment-dim);
+  font-size: 0.9rem;
+}
+
+/* Layout: board left, panels right; stacks on narrow screens. */
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+  gap: 1.25rem;
+  align-items: start;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1rem 1.25rem 2rem;
+}
+
+.board-area {
+  min-width: 0;
+}
+
+/* --- Board --- */
+.board {
+  display: grid;
+  grid-template-columns: 1.4rem repeat(13, 1fr);
+  grid-auto-rows: minmax(0, auto);
+  gap: 2px;
+  background: var(--board-line);
+  border: 3px solid var(--stone-600);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+.board.no-coords {
+  grid-template-columns: repeat(13, 1fr);
+}
+/* Subtle one-shot fade when the board reorients for the next player. This is a
+   pure opacity animation — no rotation (labels stay upright) and pointer events
+   are never disabled, so it does not delay interaction. */
+.board.is-flipping {
+  animation: board-flip-fade 140ms ease-out;
+}
+@keyframes board-flip-fade {
+  from {
+    opacity: 0.45;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .board.is-flipping {
+    animation: none;
+  }
+}
+.board.no-coords .coord-label {
+  display: none;
+}
+
+.coord-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  color: var(--parchment-dim);
+  font-weight: 600;
+  user-select: none;
+}
+.coord-label.col-label {
+  padding-bottom: 2px;
+}
+
+.cell {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border: none;
+  margin: 0;
+  padding: 0;
+  background: var(--square-light);
+  color: var(--stone-900);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 2px;
+  transition: background 0.12s ease, box-shadow 0.12s ease;
+}
+/* Subtle checker via row+col parity is not trivial in grid; use a faint tint. */
+.cell:hover {
+  filter: brightness(1.05);
+}
+.cell:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+  z-index: 2;
+}
+
+/* Terrain */
+.cell.wall {
+  background: var(--wall);
+  cursor: default;
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(0, 0, 0, 0.12) 0 4px,
+    transparent 4px 8px
+  );
+}
+.cell.inner {
+  background: var(--inner);
+}
+.cell.reserved {
+  background: var(--reserved);
+  box-shadow: inset 0 0 0 2px rgba(90, 80, 60, 0.35);
+}
+.cell.cannon-west {
+  background: var(--cannon-west);
+}
+.cell.cannon-east {
+  background: var(--cannon-east);
+}
+.cell.gate.gate-open {
+  background: var(--gate-open);
+}
+.cell.gate.gate-closed {
+  background: var(--gate-closed);
+  cursor: default;
+}
+.cell.boundary-green {
+  box-shadow: inset 0 3px 0 -1px rgba(91, 125, 85, 0.85);
+}
+.cell.boundary-blue {
+  box-shadow: inset 0 -3px 0 -1px rgba(79, 109, 147, 0.85);
+}
+
+/* Last-move indicator: clear amber origin, more prominent destination. A
+   translucent amber wash layers over the base square (incl. Cannon tiles) and
+   sits behind the piece, so labels/colors stay readable. */
+.cell.last-move-from {
+  background-image: linear-gradient(
+    rgba(224, 179, 84, 0.32),
+    rgba(224, 179, 84, 0.32)
+  );
+  box-shadow: inset 0 0 0 1px rgba(224, 179, 84, 0.6);
+}
+.cell.last-move-to {
+  background-image: linear-gradient(
+    rgba(224, 179, 84, 0.52),
+    rgba(224, 179, 84, 0.52)
+  );
+  box-shadow:
+    inset 0 0 0 3px rgba(224, 179, 84, 0.92),
+    0 0 8px 1px rgba(224, 179, 84, 0.55);
+}
+
+.terrain-glyph {
+  position: absolute;
+  font-size: 0.8rem;
+  opacity: 0.5;
+  color: var(--stone-900);
+  pointer-events: none;
+}
+.gate-closed .terrain-glyph {
+  color: var(--parchment-dim);
+  opacity: 0.7;
+}
+
+.flag-marker {
+  font-size: 1.15rem;
+  color: var(--flag-tile);
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.5));
+}
+
+/* Pieces */
+.piece {
+  position: relative;
+  width: 82%;
+  height: 82%;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: #f4efe4;
+  box-shadow: 0 2px 3px rgba(0, 0, 0, 0.4), inset 0 0 0 2px rgba(255, 255, 255, 0.15);
+  pointer-events: none;
+}
+.piece.green {
+  background: radial-gradient(circle at 35% 30%, var(--green), var(--green-dark));
+  border: 1px solid #2f4a2c;
+}
+.piece.blue {
+  background: radial-gradient(circle at 35% 30%, var(--blue), var(--blue-dark));
+  border: 1px solid #2a3d54;
+}
+.piece.carrier {
+  box-shadow: 0 0 0 2px var(--flag-tile), 0 2px 4px rgba(0, 0, 0, 0.5);
+}
+.carry-flag {
+  position: absolute;
+  top: -6px;
+  right: -4px;
+  font-size: 0.75rem;
+  color: var(--flag-tile);
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.6);
+}
+
+/* Selection & highlights */
+.cell.mine {
+  cursor: pointer;
+}
+.cell.mine:hover {
+  box-shadow: inset 0 0 0 2px var(--focus);
+}
+.cell.selected {
+  box-shadow: inset 0 0 0 3px var(--focus);
+  z-index: 1;
+}
+.cell.legal-move::after {
+  content: "";
+  position: absolute;
+  width: 34%;
+  height: 34%;
+  border-radius: 50%;
+  background: var(--legal-move);
+  pointer-events: none;
+}
+.cell.legal-capture {
+  box-shadow: inset 0 0 0 3px var(--legal-capture);
+}
+.cell.legal-capture::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(181, 70, 47, 0.18);
+  pointer-events: none;
+}
+
+.selection-summary {
+  margin-top: 0.6rem;
+  min-height: 1.5rem;
+  font-size: 0.85rem;
+  color: var(--parchment-dim);
+  line-height: 1.35;
+}
+.selection-summary strong {
+  color: var(--parchment);
+}
+.selection-summary em {
+  color: var(--gate-open);
+  font-style: normal;
+}
+
+/* --- Panels --- */
+.panels {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.panels h2 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--gate-open);
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.controls button,
+.rules-head button {
+  background: var(--stone-700);
+  color: var(--parchment);
+  border: 1px solid var(--stone-600);
+  border-radius: 4px;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.controls button:hover,
+.rules-head button:hover {
+  background: var(--stone-600);
+}
+.controls button[aria-pressed="true"] {
+  border-color: var(--gate-open);
+  color: var(--gate-open);
+}
+
+.status,
+.legend,
+.history {
+  background: var(--stone-800);
+  border: 1px solid var(--stone-700);
+  border-radius: 6px;
+  padding: 0.8rem 0.9rem;
+}
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.2rem 0;
+  border-bottom: 1px dashed var(--stone-700);
+  font-size: 0.85rem;
+}
+.status-row:last-child {
+  border-bottom: none;
+}
+.status-label {
+  color: var(--parchment-dim);
+}
+.status-value {
+  text-align: right;
+  font-weight: 600;
+}
+.status-value.green {
+  color: var(--green);
+}
+.status-value.blue {
+  color: #7ea0c8;
+}
+.status-value.win {
+  color: var(--flag-tile);
+}
+
+.legend ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.3rem 0.8rem;
+  font-size: 0.8rem;
+}
+.legend-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.7rem;
+  padding: 0.05rem 0.25rem;
+  margin-right: 0.35rem;
+  border-radius: 3px;
+  background: var(--stone-600);
+  font-weight: 700;
+  font-size: 0.72rem;
+}
+
+.history ol {
+  list-style: decimal;
+  margin: 0;
+  padding-left: 1.4rem;
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+.history li {
+  padding: 0.1rem 0;
+  color: var(--parchment-dim);
+}
+
+/* --- Rules panel --- */
+.rules-panel[hidden] {
+  display: none;
+}
+.rules-panel {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 9, 8, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  z-index: 50;
+}
+.rules-inner {
+  background: var(--stone-800);
+  border: 1px solid var(--stone-600);
+  border-radius: 8px;
+  max-width: 720px;
+  width: 100%;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+.rules-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.9rem 1.1rem;
+  border-bottom: 1px solid var(--stone-700);
+}
+.rules-head h2 {
+  margin: 0;
+  color: var(--gate-open);
+  font-size: 1rem;
+}
+.rules-body {
+  overflow-y: auto;
+  padding: 0.5rem 1.1rem 1.2rem;
+}
+.rules-body section {
+  margin-top: 1rem;
+}
+.rules-body h3 {
+  margin: 0 0 0.3rem;
+  color: var(--parchment);
+  font-size: 0.92rem;
+}
+.rules-body p {
+  margin: 0.3rem 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--parchment-dim);
+}
+
+/* --- Responsive --- */
+@media (max-width: 860px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+  .board-area {
+    order: 0;
+  }
+  .panels {
+    order: 1;
+  }
+  .legend ul {
+    grid-template-columns: 1fr 1fr 1fr;
+  }
+}
