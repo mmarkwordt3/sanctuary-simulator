@@ -3,6 +3,7 @@ import { fromCoord, toCoord } from "../src/game/coords.ts";
 import { legalMovesForPiece } from "../src/game/movement.ts";
 import { applyMove } from "../src/game/reducer.ts";
 import { isInnerCircle } from "../src/game/terrain.ts";
+import { canonicalMoveLabel, mirrorLabel, mirrorInvariantMoveKey, mirrorState, moveLabel } from "./mirror.ts";
 import type { Coord, GameState, Move, Piece, Player } from "../src/game/types.ts";
 
 export type AgentName =
@@ -274,8 +275,20 @@ export function evaluateState(
   return b;
 }
 
-function moveTieKey(move: Move, seed: number): string {
-  return `${(seed * 1103515245 + move.pieceId.length * 97 + move.to.col * 17 + move.to.row) >>> 0}:${move.pieceId}:${move.to.col}:${move.to.row}`;
+function moveTieKey(state: GameState, move: Move, seed: number): string {
+  const label = moveLabel(state, move);
+  const mirrored = mirrorLabel(label);
+  const orientation = label <= mirrored ? 0 : 1;
+  const canonical = canonicalMoveLabel(state, move);
+  const stateOrientation = positionKey(state) <= positionKey(mirrorState(state)) ? 0 : 1;
+  const preferred = (((seed * 1103515245 + hashString(canonical)) >>> 0) & 1) ^ stateOrientation;
+  return `${mirrorInvariantMoveKey(state, move)}:${orientation === preferred ? 0 : 1}:${canonical}`;
+}
+
+function hashString(s: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < s.length; i++) hash = Math.imul(hash ^ s.charCodeAt(i), 16777619);
+  return hash >>> 0;
 }
 
 const DIVERSITY_MARGIN: Record<DiversityLevel, number> = {
@@ -315,7 +328,7 @@ function evaluateMove(
   if (isImmediateReversal(context.previousMove, move, state)) score += EVALUATION_WEIGHTS.immediateReversal;
   const repeatCount = context.recentPositions?.get(positionKey(next)) ?? 0;
   if (repeatCount) score += repeatCount * EVALUATION_WEIGHTS.repeatedPosition;
-  return { move, score, breakdown, principalVariation, tie: moveTieKey(move, context.seed) };
+  return { move, score, breakdown, principalVariation, tie: moveTieKey(state, move, context.seed) };
 }
 
 function rankedScoredMoves(
@@ -341,7 +354,7 @@ function staticRankedMoves(state: GameState, moves: Move[], player: Player, cont
       return {
         move,
         score: next === state ? -Infinity : evaluateState(next, player, context).total,
-        tie: moveTieKey(move, context.seed),
+        tie: moveTieKey(state, move, context.seed),
       };
     })
     .sort((a, b) => b.score - a.score || a.tie.localeCompare(b.tie))
