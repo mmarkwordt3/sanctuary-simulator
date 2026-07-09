@@ -1,9 +1,10 @@
-import { runOpening, runStandard, type ProgressUpdate, type RunResult } from "./simulation-runner.ts";
-import type { OpeningSettings, StandardSettings } from "./config.ts";
+import { runOpening, runStandard, runTargetedOpening, type ProgressUpdate, type RunResult } from "./simulation-runner.ts";
+import type { OpeningSettings, StandardSettings, TargetedOpeningSettings } from "./config.ts";
 
 export type WorkerRequest =
   | { type: "start-standard"; settings: StandardSettings }
   | { type: "start-opening"; settings: OpeningSettings }
+  | { type: "start-targeted"; settings: TargetedOpeningSettings }
   | { type: "pause" }
   | { type: "resume" }
   | { type: "cancel" };
@@ -48,7 +49,9 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   try {
     const result = message.type === "start-standard"
       ? await runStandard(message.settings, control)
-      : await runOpening(message.settings, control);
+      : message.type === "start-opening"
+        ? await runOpening(message.settings, control)
+        : await runTargetedOpening(message.settings, control);
     postMessage({ type: result.cancelled ? "cancelled" : "complete", result } satisfies WorkerResponse);
   } catch (error) {
     postMessage({ type: "error", message: error instanceof Error ? error.message : String(error) } satisfies WorkerResponse);

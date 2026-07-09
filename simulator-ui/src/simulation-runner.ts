@@ -11,7 +11,7 @@ import {
   selectMoveDetailed,
 } from "../../simulator/agents.ts";
 import { canonicalLabel } from "../../simulator/mirror.ts";
-import { DEFAULT_SETTINGS, type OpeningSettings, type PositionSampling, type StandardSettings } from "./config.ts";
+import { DEFAULT_SETTINGS, type OpeningSettings, type PositionSampling, type StandardSettings, type TargetedOpeningSettings } from "./config.ts";
 import { jsonl, markdownSummary, toCsv, type ExportFile } from "./exporters.ts";
 
 export interface RunnerControl {
@@ -42,6 +42,25 @@ export interface GameRecord {
   moves: string[];
   first10: string;
   opening?: string;
+  forcedGreenOpening?: string;
+  forcedBlueReply?: string;
+  greenOpeningLabel?: string;
+  blueReplyLabel?: string;
+  matchupId?: string;
+  mirrorPairId?: string;
+  requestedSearchDepth?: number;
+  completedSearchDepth?: number;
+  nodesSearched?: number;
+  leafEvaluations?: number;
+  alphaBetaCutoffs?: number;
+  transpositionTableHits?: number;
+  searchElapsedMs?: number;
+  timedOut?: boolean;
+  principalVariation?: string;
+  firstPickupPlayer?: string;
+  pickupPly?: number;
+  extractionFailure?: boolean;
+  carrierRouted?: boolean;
   metrics: Metrics;
 }
 
@@ -92,6 +111,59 @@ export async function runStandard(settings: StandardSettings, control: RunnerCon
     if (i % 2 === 0 || i === settings.games - 1) control.onProgress(progress(games, settings.games));
   }
   return finalize(games, positions, [], "standard", settings, control.isCancelled());
+}
+
+
+export interface TargetedOpeningOption { move: Move; label: string; replies: Array<{ move: Move; label: string }> }
+
+export function targetedOpeningOptions(): TargetedOpeningOption[] {
+  const initial = createInitialState();
+  return legalMovesForState(initial).map((move) => {
+    const after = applyMove(initial, move);
+    return { move, label: moveLabel(initial, move), replies: after === initial ? [] : legalMovesForState(after).map((reply) => ({ move: reply, label: moveLabel(after, reply) })) };
+  });
+}
+
+export function suspectedBlueFlagBearerPreset(): TargetedOpeningSettings {
+  const options = targetedOpeningOptions();
+  const selectedBlueRepliesByOpening: Record<string, string[]> = {};
+  for (const opening of options) {
+    selectedBlueRepliesByOpening[opening.label] = opening.replies.filter((r) => /Flag Bearer:G13-(E11|I11)|blue.*flagBearer/i.test(r.label)).filter((r) => /G13-(E11|I11)/.test(r.label)).map((r) => r.label);
+  }
+  return { ...DEFAULT_SETTINGS.targeted, selectedGreenOpenings: options.map((o) => o.label), selectedBlueRepliesByOpening };
+}
+
+export function buildTargetedJobs(settings: TargetedOpeningSettings) {
+  const options = targetedOpeningOptions();
+  const jobs: Array<{ opening: string; blueReply: string; prefix: Move[]; matchupId: string; mirrorPairId: string }> = [];
+  for (const opening of options) {
+    if (settings.selectedGreenOpenings.length && !settings.selectedGreenOpenings.includes(opening.label)) continue;
+    const selected = settings.selectedBlueRepliesByOpening[opening.label] ?? [];
+    for (const reply of opening.replies) {
+      if (!selected.includes(reply.label)) continue;
+      const matchupId = `${opening.label}|${reply.label}`;
+      jobs.push({ opening: opening.label, blueReply: reply.label, prefix: [opening.move, reply.move], matchupId, mirrorPairId: `${canonicalLabel(opening.label)}|${canonicalLabel(reply.label)}` });
+    }
+  }
+  return jobs;
+}
+
+export async function runTargetedOpening(settings: TargetedOpeningSettings, control: RunnerControl): Promise<RunResult> {
+  const jobs = buildTargetedJobs(settings);
+  const totalGames = jobs.length * settings.gamesPerMatchup;
+  const games: GameRecord[] = [];
+  const positions: Array<Record<string, unknown>> = [];
+  let id = 1;
+  for (const jobGroup of groupJobsByMirror(jobs)) {
+    for (const job of jobGroup) for (let i = 0; i < settings.gamesPerMatchup; i++) {
+      await control.waitIfPaused();
+      if (control.isCancelled()) break;
+      games.push(playOne({ id: id++, seed: settings.seed + games.length, greenAgent: settings.greenAgent, blueAgent: settings.blueAgent, greenDiversity: settings.greenDiversity, blueDiversity: settings.blueDiversity, searchDepth: settings.searchDepth, timeLimitMs: settings.timeLimitMs, maxPlies: settings.maxPlies, positionSampling: settings.positionSampling, positions, forcedPrefix: job.prefix, opening: job.opening, forcedGreenOpening: job.opening, forcedBlueReply: job.blueReply, matchupId: job.matchupId, mirrorPairId: job.mirrorPairId }));
+      control.onProgress({ ...progress(games, totalGames), currentOpening: job.opening });
+    }
+    if (control.isCancelled()) break;
+  }
+  return finalize(games, positions, summarizeOpenings(games, settings as any), "targeted", settings, control.isCancelled());
 }
 
 export async function runOpening(settings: OpeningSettings, control: RunnerControl): Promise<RunResult> {
@@ -162,6 +234,11 @@ interface PlayArgs {
   positions: Array<Record<string, unknown>>;
   forcedPrefix?: Move[];
   opening?: string;
+  timeLimitMs?: number;
+  forcedGreenOpening?: string;
+  forcedBlueReply?: string;
+  matchupId?: string;
+  mirrorPairId?: string;
 }
 
 function playOne(args: PlayArgs): GameRecord {
@@ -170,6 +247,9 @@ function playOne(args: PlayArgs): GameRecord {
   let previousMove: MoveRecord | null = null;
   const moves: Move[] = [];
   const labels: string[] = [];
+  let searchDiagnostics = { completedSearchDepth: 0, nodesSearched: 0, leafEvaluations: 0, alphaBetaCutoffs: 0, transpositionTableHits: 0, searchElapsedMs: 0, timedOut: false, principalVariation: "" };
+  let firstPickupPlayer: string | undefined;
+  let pickupPly: number | undefined;
   const metrics: Metrics = {
     sideGatesOpened: 0,
     sanctuaryEntries: 0,
@@ -185,10 +265,12 @@ function playOne(args: PlayArgs): GameRecord {
   };
 
   for (const forced of args.forcedPrefix ?? []) {
+    const beforeCarrier = state.flag.carrierId;
     const applied = applyTrackedMove(state, forced, moves, labels, metrics);
     if (!applied) { metrics.illegalMoves++; break; }
     previousMove = applied.previousMove;
     state = applied.state;
+    if (!beforeCarrier && state.flag.carrierId && !firstPickupPlayer) { firstPickupPlayer = previousMove.pieceId.startsWith("G") ? "green" : "blue"; pickupPly = moves.length; }
   }
 
   while (!state.winner && moves.length < args.maxPlies && metrics.illegalMoves === 0) {
@@ -201,16 +283,29 @@ function playOne(args: PlayArgs): GameRecord {
       previousMove,
       searchDepth: args.searchDepth,
       diversity,
+      timeLimitMs: args.timeLimitMs,
     });
     if (!selection.move) break;
+    if (selection.diagnostics) {
+      searchDiagnostics.completedSearchDepth = Math.max(searchDiagnostics.completedSearchDepth, selection.diagnostics.completedDepth);
+      searchDiagnostics.nodesSearched += selection.diagnostics.nodesSearched;
+      searchDiagnostics.leafEvaluations += selection.diagnostics.leafEvaluations;
+      searchDiagnostics.alphaBetaCutoffs += selection.diagnostics.alphaBetaCutoffs;
+      searchDiagnostics.transpositionTableHits += selection.diagnostics.transpositionTableHits;
+      searchDiagnostics.searchElapsedMs += selection.diagnostics.elapsedMs;
+      searchDiagnostics.timedOut ||= selection.diagnostics.timedOut;
+      searchDiagnostics.principalVariation = selection.diagnostics.principalVariation.map((m) => moveLabel(state, m)).join(" ");
+    }
     if (selection.diversityAffectedChoice) {
       metrics.diversityChanges++;
       metrics.diversityScoreLoss += selection.scoreLoss;
     }
+    const beforeCarrier = state.flag.carrierId;
     const applied = applyTrackedMove(state, selection.move, moves, labels, metrics);
     if (!applied) { metrics.illegalMoves++; break; }
     previousMove = applied.previousMove;
     state = applied.state;
+    if (!beforeCarrier && state.flag.carrierId && !firstPickupPlayer) { firstPickupPlayer = previousMove.pieceId.startsWith("G") ? "green" : "blue"; pickupPly = moves.length; }
     if (args.positionSampling === "every-ply") args.positions.push(positionRecord(args.id, moves.length, state));
   }
   if (args.positionSampling === "final") args.positions.push(positionRecord(args.id, moves.length, state));
@@ -227,6 +322,25 @@ function playOne(args: PlayArgs): GameRecord {
     moves: labels,
     first10: labels.slice(0, 10).join(" "),
     opening: args.opening ?? labels[0],
+    forcedGreenOpening: args.forcedGreenOpening,
+    forcedBlueReply: args.forcedBlueReply,
+    greenOpeningLabel: args.forcedGreenOpening,
+    blueReplyLabel: args.forcedBlueReply,
+    matchupId: args.matchupId,
+    mirrorPairId: args.mirrorPairId,
+    requestedSearchDepth: args.searchDepth,
+    completedSearchDepth: searchDiagnostics.completedSearchDepth,
+    nodesSearched: searchDiagnostics.nodesSearched,
+    leafEvaluations: searchDiagnostics.leafEvaluations,
+    alphaBetaCutoffs: searchDiagnostics.alphaBetaCutoffs,
+    transpositionTableHits: searchDiagnostics.transpositionTableHits,
+    searchElapsedMs: Number(searchDiagnostics.searchElapsedMs.toFixed(3)),
+    timedOut: searchDiagnostics.timedOut,
+    principalVariation: searchDiagnostics.principalVariation,
+    firstPickupPlayer,
+    pickupPly,
+    extractionFailure: metrics.extractionFailures > 0,
+    carrierRouted: metrics.ladenFlagBearerRoutings > 0,
     metrics,
   };
 }
@@ -344,7 +458,7 @@ function finalize(games: GameRecord[], positions: Array<Record<string, unknown>>
     cancelled,
     allReplayVerified: summary.replayFailures === 0,
   };
-  const summaryRows = games.map((g) => ({ id: g.id, seed: g.seed, winner: g.winner ?? "draw", drawReason: g.drawReason, plies: g.plies, replayOk: g.replayOk, opening: g.opening }));
+  const summaryRows = games.map((g) => ({ id: g.id, seed: g.seed, winner: g.winner ?? "draw", drawReason: g.drawReason, plies: g.plies, replayOk: g.replayOk, opening: g.opening, forcedGreenOpening: g.forcedGreenOpening, forcedBlueReply: g.forcedBlueReply, greenOpeningLabel: g.greenOpeningLabel, blueReplyLabel: g.blueReplyLabel, matchupId: g.matchupId, mirrorPairId: g.mirrorPairId, requestedSearchDepth: g.requestedSearchDepth, completedSearchDepth: g.completedSearchDepth, nodesSearched: g.nodesSearched, leafEvaluations: g.leafEvaluations, alphaBetaCutoffs: g.alphaBetaCutoffs, transpositionTableHits: g.transpositionTableHits, searchElapsedMs: g.searchElapsedMs, timedOut: g.timedOut, principalVariation: g.principalVariation, firstPickupPlayer: g.firstPickupPlayer, pickupPly: g.pickupPly, extractionFailure: g.extractionFailure, carrierRouted: g.carrierRouted }));
   const files: ExportFile[] = [
     { name: "games.jsonl", mime: "application/x-ndjson", content: jsonl(games) },
     { name: "positions.jsonl", mime: "application/x-ndjson", content: jsonl(positions) },

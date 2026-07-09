@@ -3,7 +3,7 @@ import { fromCoord, toCoord } from "../src/game/coords.ts";
 import { legalMovesForPiece } from "../src/game/movement.ts";
 import { applyMove } from "../src/game/reducer.ts";
 import { isInnerCircle } from "../src/game/terrain.ts";
-import { canonicalMoveLabel, mirrorLabel, mirrorInvariantMoveKey, mirrorState, moveLabel } from "./mirror.ts";
+import { canonicalMoveLabel, mirrorLabel, mirrorInvariantMoveKey, mirrorState, mirrorMove, moveLabel } from "./mirror.ts";
 import type { Coord, GameState, Move, Piece, Player } from "../src/game/types.ts";
 
 export type AgentName =
@@ -14,7 +14,9 @@ export type AgentName =
   | "heuristic-deterministic"
   | "heuristic-diverse"
   | "search-deterministic"
-  | "search-diverse";
+  | "search-diverse"
+  | "search-alpha-beta-deterministic"
+  | "search-alpha-beta-diverse";
 
 export interface AgentContext {
   seed: number;
@@ -22,6 +24,7 @@ export interface AgentContext {
   previousMove?: MoveRecord | null;
   searchDepth?: number;
   diversity?: DiversityLevel;
+  timeLimitMs?: number;
 }
 
 export type DiversityLevel = 0 | 1 | 2 | 3;
@@ -56,6 +59,20 @@ export interface ScoredMove {
   tie: string;
 }
 
+export interface SearchDiagnostics {
+  requestedDepth: number;
+  completedDepth: number;
+  nodesSearched: number;
+  leafEvaluations: number;
+  alphaBetaCutoffs: number;
+  transpositionTableHits: number;
+  elapsedMs: number;
+  timedOut: boolean;
+  principalVariation: Move[];
+  scoreByCompletedDepth: Record<number, number>;
+  selectedMoveChangedByDepth: boolean;
+}
+
 export interface SelectionResult {
   move: Move | null;
   legalMoveCount: number;
@@ -65,6 +82,7 @@ export interface SelectionResult {
   diversityAffectedChoice: boolean;
   candidates: ScoredMove[];
   principalVariation: Move[];
+  diagnostics?: SearchDiagnostics;
 }
 
 export const EVALUATION_WEIGHTS = {
@@ -305,11 +323,15 @@ function normalizedAgent(agent: AgentName): AgentName {
 }
 
 function isSearchAgent(agent: AgentName): boolean {
-  return agent === "search" || agent === "search-deterministic" || agent === "search-diverse";
+  return agent === "search" || agent === "search-deterministic" || agent === "search-diverse" || agent === "search-alpha-beta-deterministic" || agent === "search-alpha-beta-diverse";
+}
+
+function isAlphaBetaAgent(agent: AgentName): boolean {
+  return agent === "search-alpha-beta-deterministic" || agent === "search-alpha-beta-diverse";
 }
 
 function isDiverseAgent(agent: AgentName): boolean {
-  return agent === "heuristic-diverse" || agent === "search-diverse";
+  return agent === "heuristic-diverse" || agent === "search-diverse" || agent === "search-alpha-beta-diverse";
 }
 
 function evaluateMove(
@@ -454,6 +476,118 @@ function searchValueAfterMove(
   return best;
 }
 
+
+type BoundType = "exact" | "lower" | "upper";
+interface TranspositionEntry { score: number; searchedDepth: number; bound: BoundType; bestMove?: Move; pv: Move[]; }
+interface AlphaBetaState { table: Map<string, TranspositionEntry>; diagnostics: SearchDiagnostics; start: number; limit: number; timedOut: boolean; previousPv: Move[]; }
+
+function sameMove(a: Move | undefined | null, b: Move | undefined | null): boolean {
+  return !!a && !!b && a.pieceId === b.pieceId && a.to.col === b.to.col && a.to.row === b.to.row;
+}
+function ttKey(state: GameState, depth: number, root: Player): string { return `${root}|${depth}|${positionKey(state)}`; }
+function checkTimeout(s: AlphaBetaState): boolean { if (s.limit > 0 && performance.now() - s.start >= s.limit) { s.timedOut = true; return true; } return false; }
+function moveCategory(state: GameState, move: Move): number {
+  const piece = state.pieces.find((p) => p.id === move.pieceId);
+  const occ = pieceAt(state, move.to);
+  const next = applyMove(state, move);
+  if (next !== state && next.winner === state.current) return 0;
+  if (state.forcedGateDeparture) return 1;
+  if (next !== state && !state.flag.carrierId && next.flag.carrierId) return 2;
+  if (occ && occ.player !== state.current && (occ.id === state.flag.carrierId || piece?.id === state.flag.carrierId)) return 3;
+  if (occ && occ.player !== state.current) return 4;
+  if (next !== state && (next.walls.east !== state.walls.east || next.walls.west !== state.walls.west)) return 5;
+  return 9;
+}
+function orderedAlphaBetaMoves(state: GameState, moves: Move[], root: Player, context: AgentContext, previousPvMove?: Move, ttMove?: Move): Move[] {
+  return moves.map((move) => {
+    const next = applyMove(state, move);
+    return { move, cat: moveCategory(state, move), pv: sameMove(move, previousPvMove) ? 0 : 1, tt: sameMove(move, ttMove) ? 0 : 1, score: next === state ? -Infinity : evaluateState(next, root, context).total, tie: moveTieKey(state, move, context.seed) };
+  }).sort((a,b) => a.cat-b.cat || a.pv-b.pv || a.tt-b.tt || b.score-a.score || a.tie.localeCompare(b.tie)).map(x=>x.move);
+}
+
+function alphaBetaValue(state: GameState, depth: number, root: Player, context: AgentContext, ab: AlphaBetaState, alpha: number, beta: number, path: string[]): { score: number; pv: Move[] } | null {
+  if (checkTimeout(ab)) return null;
+  ab.diagnostics.nodesSearched++;
+  const pkey = positionKey(state);
+  if (depth === 0 || state.winner || path.includes(pkey)) {
+    ab.diagnostics.leafEvaluations++;
+    const repeat = path.includes(pkey) ? EVALUATION_WEIGHTS.repeatedPosition * 2 : 0;
+    return { score: evaluateState(state, root, context).total + repeat, pv: [] };
+  }
+  const originalAlpha = alpha, originalBeta = beta;
+  const key = ttKey(state, depth, root);
+  const cached = ab.table.get(key);
+  if (cached && cached.searchedDepth >= depth) {
+    ab.diagnostics.transpositionTableHits++;
+    if (cached.bound === "exact") return { score: cached.score, pv: cached.pv };
+    if (cached.bound === "lower") alpha = Math.max(alpha, cached.score);
+    if (cached.bound === "upper") beta = Math.min(beta, cached.score);
+    if (alpha >= beta) return { score: cached.score, pv: cached.pv };
+  }
+  const moves = orderedAlphaBetaMoves(state, staticRankedMoves(state, allLegalMoves(state), state.current, context, 12), root, context, ab.previousPv[ab.diagnostics.requestedDepth - depth], cached?.bestMove);
+  if (!moves.length) { ab.diagnostics.leafEvaluations++; return { score: evaluateState(state, root, context).total, pv: [] }; }
+  const maximizing = state.current === root;
+  let best = maximizing ? -Infinity : Infinity;
+  let bestMove: Move | undefined;
+  let bestPv: Move[] = [];
+  for (const move of moves) {
+    const next = applyMove(state, move);
+    if (next === state) continue;
+    const child = alphaBetaValue(next, depth - 1, root, context, ab, alpha, beta, [...path, pkey]);
+    if (!child) return null;
+    if ((maximizing && child.score > best) || (!maximizing && child.score < best) || (child.score === best && (!bestMove || moveTieKey(state, move, context.seed).localeCompare(moveTieKey(state, bestMove, context.seed)) < 0))) {
+      best = child.score; bestMove = move; bestPv = [move, ...child.pv];
+    }
+    if (maximizing) alpha = Math.max(alpha, best); else beta = Math.min(beta, best);
+    if (alpha >= beta) { ab.diagnostics.alphaBetaCutoffs++; break; }
+  }
+  const bound: BoundType = best <= originalAlpha ? "upper" : best >= originalBeta ? "lower" : "exact";
+  ab.table.set(key, { score: best, searchedDepth: depth, bound, bestMove, pv: bestPv });
+  return { score: best, pv: bestPv };
+}
+
+function alphaBetaSelection(state: GameState, context: AgentContext, requestedDepth: number, diverse: boolean, canonicalize = true): SelectionResult {
+  if (canonicalize && positionKey(state) > positionKey(mirrorState(state))) {
+    const mirrored = alphaBetaSelection(mirrorState(state), context, requestedDepth, diverse, false);
+    return { ...mirrored, move: mirrored.move ? mirrorMove(mirrored.move) : null, candidates: mirrored.candidates.map((c) => ({ ...c, move: mirrorMove(c.move), principalVariation: c.principalVariation.map(mirrorMove) })), principalVariation: mirrored.principalVariation.map(mirrorMove), diagnostics: mirrored.diagnostics ? { ...mirrored.diagnostics, principalVariation: mirrored.diagnostics.principalVariation.map(mirrorMove) } : undefined };
+  }
+  const legal = allLegalMoves(state);
+  const diagnostics: SearchDiagnostics = { requestedDepth, completedDepth: 0, nodesSearched: 0, leafEvaluations: 0, alphaBetaCutoffs: 0, transpositionTableHits: 0, elapsedMs: 0, timedOut: false, principalVariation: [], scoreByCompletedDepth: {}, selectedMoveChangedByDepth: false };
+  const ab: AlphaBetaState = { table: new Map(), diagnostics, start: performance.now(), limit: context.timeLimitMs ?? 0, timedOut: false, previousPv: [] };
+  let last: ScoredMove[] = rankedScoredMoves(state, legal, context, 1);
+  let previousSelected: Move | null = null;
+  for (let depth = 1; depth <= requestedDepth; depth++) {
+    const rootMoves = orderedAlphaBetaMoves(state, staticRankedMoves(state, legal, state.current, context, 12), state.current, context, ab.previousPv[0], undefined);
+    const scored: ScoredMove[] = [];
+    let failed = false;
+    for (const move of rootMoves) {
+      const next = applyMove(state, move);
+      if (next === state) continue;
+      const child = alphaBetaValue(next, depth - 1, state.current, context, ab, -Infinity, Infinity, [positionKey(state)]);
+      if (!child) { failed = true; break; }
+      const breakdown = evaluateState(next, state.current, context);
+      let score = child.score;
+      if (isImmediateReversal(context.previousMove, move, state)) score += EVALUATION_WEIGHTS.immediateReversal;
+      const pv = [move, ...child.pv];
+      scored.push({ move, score, breakdown, principalVariation: pv, tie: moveTieKey(state, move, context.seed) });
+    }
+    if (failed || ab.timedOut) break;
+    scored.sort((a,b)=> b.score-a.score || a.tie.localeCompare(b.tie));
+    last = scored;
+    diagnostics.completedDepth = depth;
+    diagnostics.scoreByCompletedDepth[depth] = scored[0]?.score ?? 0;
+    diagnostics.principalVariation = scored[0]?.principalVariation ?? [];
+    if (previousSelected && scored[0] && !sameMove(previousSelected, scored[0].move)) diagnostics.selectedMoveChangedByDepth = true;
+    previousSelected = scored[0]?.move ?? null;
+    ab.previousPv = diagnostics.principalVariation;
+  }
+  diagnostics.timedOut = ab.timedOut;
+  diagnostics.elapsedMs = Number((performance.now() - ab.start).toFixed(3));
+  const result = chooseScoredMove(state, last, context, diverse, legal.length);
+  result.diagnostics = { ...diagnostics, principalVariation: result.principalVariation };
+  return result;
+}
+
 export function selectMove(state: GameState, agent: AgentName, context: AgentContext): Move | null {
   return selectMoveDetailed(state, agent, context).move;
 }
@@ -505,6 +639,7 @@ export function selectMoveDetailed(state: GameState, agent: AgentName, context: 
     };
   }
   const depth = isSearchAgent(mode) ? context.searchDepth ?? 2 : 1;
+  if (isAlphaBetaAgent(mode)) return alphaBetaSelection(state, context, depth, isDiverseAgent(mode));
   const candidateMoves = isSearchAgent(mode)
     ? staticRankedMoves(state, moves, state.current, context, 12)
     : moves;
@@ -515,6 +650,78 @@ export function selectMoveDetailed(state: GameState, agent: AgentName, context: 
     isDiverseAgent(mode),
     moves.length,
   );
+}
+
+
+export interface SearchBenchmarkResult {
+  selectedMove: Move | null;
+  score: number | null;
+  nodesSearched: number;
+  elapsedMs: number;
+  alphaBetaCutoffs: number;
+  transpositionTableHits: number;
+  completedDepth: number;
+  principalVariation: Move[];
+}
+
+function countedFullSearchValue(state: GameState, depth: number, rootPlayer: Player, context: AgentContext, path: string[], counts: { nodes: number; leaves: number }, principalVariation?: Move[]): number {
+  counts.nodes++;
+  if (depth === 0 || state.winner) { counts.leaves++; return evaluateState(state, rootPlayer, context).total; }
+  const key = positionKey(state);
+  if (path.includes(key)) { counts.leaves++; return evaluateState(state, rootPlayer, context).total + EVALUATION_WEIGHTS.repeatedPosition * 2; }
+  const moves = staticRankedMoves(state, allLegalMoves(state), state.current, context, 12);
+  if (!moves.length) { counts.leaves++; return evaluateState(state, rootPlayer, context).total; }
+  const opponent = state.current !== rootPlayer;
+  let best = opponent ? Infinity : -Infinity;
+  let bestMove: Move | null = null;
+  for (const move of moves) {
+    const next = applyMove(state, move);
+    if (next === state) continue;
+    const value = countedFullSearchValue(next, depth - 1, rootPlayer, context, [...path, key], counts);
+    if ((opponent && value < best) || (!opponent && value > best)) { best = value; bestMove = move; }
+  }
+  if (bestMove && principalVariation) principalVariation.push(bestMove);
+  return best;
+}
+
+
+function benchmarkAlphaBetaFixedDepth(state: GameState, context: AgentContext): SearchBenchmarkResult {
+  const started = performance.now();
+  const depth = context.searchDepth ?? 2;
+  const diagnostics: SearchDiagnostics = { requestedDepth: depth, completedDepth: depth, nodesSearched: 0, leafEvaluations: 0, alphaBetaCutoffs: 0, transpositionTableHits: 0, elapsedMs: 0, timedOut: false, principalVariation: [], scoreByCompletedDepth: {}, selectedMoveChangedByDepth: false };
+  const ab: AlphaBetaState = { table: new Map(), diagnostics, start: started, limit: 0, timedOut: false, previousPv: [] };
+  const legal = allLegalMoves(state);
+  const rootMoves = orderedAlphaBetaMoves(state, staticRankedMoves(state, legal, state.current, context, 12), state.current, context);
+  const scored: ScoredMove[] = [];
+  for (const move of rootMoves) {
+    const next = applyMove(state, move);
+    if (next === state) continue;
+    const child = alphaBetaValue(next, depth - 1, state.current, context, ab, -Infinity, Infinity, [positionKey(state)]);
+    if (!child) continue;
+    const breakdown = evaluateState(next, state.current, context);
+    scored.push({ move, score: child.score, breakdown, principalVariation: [move, ...child.pv], tie: moveTieKey(state, move, context.seed) });
+  }
+  scored.sort((a,b) => b.score-a.score || a.tie.localeCompare(b.tie));
+  const chosen = chooseScoredMove(state, scored, context, false, legal.length);
+  return { selectedMove: chosen.move, score: chosen.selectedScore, nodesSearched: diagnostics.nodesSearched, elapsedMs: Number((performance.now() - started).toFixed(3)), alphaBetaCutoffs: diagnostics.alphaBetaCutoffs, transpositionTableHits: diagnostics.transpositionTableHits, completedDepth: depth, principalVariation: chosen.principalVariation };
+}
+
+export function benchmarkSearchSelection(state: GameState, agent: "search-deterministic" | "search-alpha-beta-deterministic", context: AgentContext): SearchBenchmarkResult {
+  const started = performance.now();
+  if (agent === "search-alpha-beta-deterministic") return benchmarkAlphaBetaFixedDepth(state, context);
+  const moves = staticRankedMoves(state, allLegalMoves(state), state.current, context, 12);
+  const counts = { nodes: 0, leaves: 0 };
+  const scored = moves.map((move) => {
+    const next = applyMove(state, move);
+    if (next === state) return null;
+    const pv = [move];
+    const breakdown = evaluateState(next, state.current, context);
+    const depth = context.searchDepth ?? 2;
+    const score = depth > 1 ? countedFullSearchValue(next, depth - 1, state.current, context, [positionKey(state)], counts, pv) : breakdown.total;
+    return { move, score, breakdown, principalVariation: pv, tie: moveTieKey(state, move, context.seed) } satisfies ScoredMove;
+  }).filter((m): m is ScoredMove => m !== null).sort((a,b) => b.score-a.score || a.tie.localeCompare(b.tie));
+  const chosen = chooseScoredMove(state, scored, context, false, allLegalMoves(state).length);
+  return { selectedMove: chosen.move, score: chosen.selectedScore, nodesSearched: counts.nodes, elapsedMs: Number((performance.now() - started).toFixed(3)), alphaBetaCutoffs: 0, transpositionTableHits: 0, completedDepth: context.searchDepth ?? 2, principalVariation: chosen.principalVariation };
 }
 
 export function diagnosticBreakdown(state: GameState, player: Player, context?: Pick<AgentContext, "recentPositions">): EvaluationBreakdown {

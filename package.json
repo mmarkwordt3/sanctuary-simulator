@@ -3,10 +3,10 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Sanctuary — a two-player abstract strategy board game for the browser.",
+  "description": "Sanctuary \u2014 a two-player abstract strategy board game for the browser.",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && (vite build || bun build src/main.ts --outdir dist --target browser)",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
