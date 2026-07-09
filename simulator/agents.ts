@@ -524,7 +524,7 @@ function alphaBetaValue(state: GameState, depth: number, root: Player, context: 
     if (cached.bound === "upper") beta = Math.min(beta, cached.score);
     if (alpha >= beta) return { score: cached.score, pv: cached.pv };
   }
-  const moves = orderedAlphaBetaMoves(state, allLegalMoves(state), root, context, ab.previousPv[ab.diagnostics.requestedDepth - depth], cached?.bestMove);
+  const moves = orderedAlphaBetaMoves(state, staticRankedMoves(state, allLegalMoves(state), state.current, context, 12), root, context, ab.previousPv[ab.diagnostics.requestedDepth - depth], cached?.bestMove);
   if (!moves.length) { ab.diagnostics.leafEvaluations++; return { score: evaluateState(state, root, context).total, pv: [] }; }
   const maximizing = state.current === root;
   let best = maximizing ? -Infinity : Infinity;
@@ -650,6 +650,78 @@ export function selectMoveDetailed(state: GameState, agent: AgentName, context: 
     isDiverseAgent(mode),
     moves.length,
   );
+}
+
+
+export interface SearchBenchmarkResult {
+  selectedMove: Move | null;
+  score: number | null;
+  nodesSearched: number;
+  elapsedMs: number;
+  alphaBetaCutoffs: number;
+  transpositionTableHits: number;
+  completedDepth: number;
+  principalVariation: Move[];
+}
+
+function countedFullSearchValue(state: GameState, depth: number, rootPlayer: Player, context: AgentContext, path: string[], counts: { nodes: number; leaves: number }, principalVariation?: Move[]): number {
+  counts.nodes++;
+  if (depth === 0 || state.winner) { counts.leaves++; return evaluateState(state, rootPlayer, context).total; }
+  const key = positionKey(state);
+  if (path.includes(key)) { counts.leaves++; return evaluateState(state, rootPlayer, context).total + EVALUATION_WEIGHTS.repeatedPosition * 2; }
+  const moves = staticRankedMoves(state, allLegalMoves(state), state.current, context, 12);
+  if (!moves.length) { counts.leaves++; return evaluateState(state, rootPlayer, context).total; }
+  const opponent = state.current !== rootPlayer;
+  let best = opponent ? Infinity : -Infinity;
+  let bestMove: Move | null = null;
+  for (const move of moves) {
+    const next = applyMove(state, move);
+    if (next === state) continue;
+    const value = countedFullSearchValue(next, depth - 1, rootPlayer, context, [...path, key], counts);
+    if ((opponent && value < best) || (!opponent && value > best)) { best = value; bestMove = move; }
+  }
+  if (bestMove && principalVariation) principalVariation.push(bestMove);
+  return best;
+}
+
+
+function benchmarkAlphaBetaFixedDepth(state: GameState, context: AgentContext): SearchBenchmarkResult {
+  const started = performance.now();
+  const depth = context.searchDepth ?? 2;
+  const diagnostics: SearchDiagnostics = { requestedDepth: depth, completedDepth: depth, nodesSearched: 0, leafEvaluations: 0, alphaBetaCutoffs: 0, transpositionTableHits: 0, elapsedMs: 0, timedOut: false, principalVariation: [], scoreByCompletedDepth: {}, selectedMoveChangedByDepth: false };
+  const ab: AlphaBetaState = { table: new Map(), diagnostics, start: started, limit: 0, timedOut: false, previousPv: [] };
+  const legal = allLegalMoves(state);
+  const rootMoves = orderedAlphaBetaMoves(state, staticRankedMoves(state, legal, state.current, context, 12), state.current, context);
+  const scored: ScoredMove[] = [];
+  for (const move of rootMoves) {
+    const next = applyMove(state, move);
+    if (next === state) continue;
+    const child = alphaBetaValue(next, depth - 1, state.current, context, ab, -Infinity, Infinity, [positionKey(state)]);
+    if (!child) continue;
+    const breakdown = evaluateState(next, state.current, context);
+    scored.push({ move, score: child.score, breakdown, principalVariation: [move, ...child.pv], tie: moveTieKey(state, move, context.seed) });
+  }
+  scored.sort((a,b) => b.score-a.score || a.tie.localeCompare(b.tie));
+  const chosen = chooseScoredMove(state, scored, context, false, legal.length);
+  return { selectedMove: chosen.move, score: chosen.selectedScore, nodesSearched: diagnostics.nodesSearched, elapsedMs: Number((performance.now() - started).toFixed(3)), alphaBetaCutoffs: diagnostics.alphaBetaCutoffs, transpositionTableHits: diagnostics.transpositionTableHits, completedDepth: depth, principalVariation: chosen.principalVariation };
+}
+
+export function benchmarkSearchSelection(state: GameState, agent: "search-deterministic" | "search-alpha-beta-deterministic", context: AgentContext): SearchBenchmarkResult {
+  const started = performance.now();
+  if (agent === "search-alpha-beta-deterministic") return benchmarkAlphaBetaFixedDepth(state, context);
+  const moves = staticRankedMoves(state, allLegalMoves(state), state.current, context, 12);
+  const counts = { nodes: 0, leaves: 0 };
+  const scored = moves.map((move) => {
+    const next = applyMove(state, move);
+    if (next === state) return null;
+    const pv = [move];
+    const breakdown = evaluateState(next, state.current, context);
+    const depth = context.searchDepth ?? 2;
+    const score = depth > 1 ? countedFullSearchValue(next, depth - 1, state.current, context, [positionKey(state)], counts, pv) : breakdown.total;
+    return { move, score, breakdown, principalVariation: pv, tie: moveTieKey(state, move, context.seed) } satisfies ScoredMove;
+  }).filter((m): m is ScoredMove => m !== null).sort((a,b) => b.score-a.score || a.tie.localeCompare(b.tie));
+  const chosen = chooseScoredMove(state, scored, context, false, allLegalMoves(state).length);
+  return { selectedMove: chosen.move, score: chosen.selectedScore, nodesSearched: counts.nodes, elapsedMs: Number((performance.now() - started).toFixed(3)), alphaBetaCutoffs: 0, transpositionTableHits: 0, completedDepth: context.searchDepth ?? 2, principalVariation: chosen.principalVariation };
 }
 
 export function diagnosticBreakdown(state: GameState, player: Player, context?: Pick<AgentContext, "recentPositions">): EvaluationBreakdown {

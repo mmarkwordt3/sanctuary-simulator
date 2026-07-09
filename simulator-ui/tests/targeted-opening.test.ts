@@ -30,7 +30,10 @@ describe("targeted opening mode", () => {
   });
 
   it("suspected Blue Flag Bearer preset produces 68 matchups", () => {
-    expect(buildTargetedJobs(suspectedBlueFlagBearerPreset())).toHaveLength(68);
+    const jobs = buildTargetedJobs(suspectedBlueFlagBearerPreset());
+    expect(jobs).toHaveLength(68);
+    expect(jobs.filter((j) => /G13-E11/.test(j.blueReply))).toHaveLength(34);
+    expect(jobs.filter((j) => /G13-I11/.test(j.blueReply))).toHaveLength(34);
   });
 
   it("mirror-paired jobs carry mirrored schedule identifiers", () => {

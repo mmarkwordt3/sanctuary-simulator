@@ -60,7 +60,11 @@ export function makeZip(files: ExportFile[]): Blob {
   }
   const centralSize = central.reduce((n, p) => n + p.length, 0);
   const end = concat([u32(0x06054b50), u16(0), u16(0), u16(files.length), u16(files.length), u32(centralSize), u32(offset), u16(0)]);
-  return new Blob([...parts, ...central, end], { type: "application/zip" });
+  return new Blob([...parts, ...central, end].map(blobPart), { type: "application/zip" });
+}
+
+function blobPart(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
 function concat(chunks: Uint8Array[]): Uint8Array {

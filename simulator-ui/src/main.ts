@@ -1,5 +1,6 @@
 import { targetedOpeningOptions, suspectedBlueFlagBearerPreset } from "./simulation-runner.ts";
-import { AGENT_CHOICES, DEFAULT_SETTINGS, agentUsesDiversity, agentUsesSearchDepth, type AgentName, type SimulatorUiSettings } from "./config.ts";
+import { AGENT_CHOICES, DEFAULT_SETTINGS, agentUsesDiversity, agentUsesSearchDepth, type SimulatorUiSettings } from "./config.ts";
+import type { AgentName } from "../../simulator/agents.ts";
 import { makeZip, type ExportFile } from "./exporters.ts";
 import type { RunResult } from "./simulation-runner.ts";
 import type { WorkerRequest, WorkerResponse } from "./worker.ts";

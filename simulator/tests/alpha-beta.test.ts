@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createInitialState } from "../../src/game/setup.ts";
 import { applyMove } from "../../src/game/reducer.ts";
-import { legalMovesForState, selectMoveDetailed } from "../agents.ts";
+import { benchmarkSearchSelection, legalMovesForState, selectMoveDetailed } from "../agents.ts";
 import { mirrorMove, mirrorState } from "../mirror.ts";
 
 const key = (m: any) => `${m?.pieceId}:${m?.to.col},${m?.to.row}`;
@@ -61,11 +61,13 @@ describe("alpha-beta search", () => {
     expect(a.selectedScore).toBe(b.selectedScore);
   });
 
-  it("benchmark equivalence searches no more nodes than full minimax estimate", () => {
-    const full = selectMoveDetailed(createInitialState(), "search-deterministic", { seed: 1, searchDepth: 2 });
-    const ab = selectMoveDetailed(createInitialState(), "search-alpha-beta-deterministic", { seed: 1, searchDepth: 2 });
-    expect(key(ab.move)).toBe(key(full.move));
-    expect(ab.diagnostics!.nodesSearched).toBeLessThanOrEqual(legalMovesForState(createInitialState()).length ** 2);
-    expect({ selectedMove: key(ab.move), score: ab.selectedScore, nodesSearched: ab.diagnostics!.nodesSearched, elapsedMs: ab.diagnostics!.elapsedMs, cutoffCount: ab.diagnostics!.alphaBetaCutoffs, cacheHitCount: ab.diagnostics!.transpositionTableHits }).toBeTruthy();
+  it("benchmark equivalence instruments full minimax and alpha-beta", () => {
+    const full = benchmarkSearchSelection(createInitialState(), "search-deterministic", { seed: 1, searchDepth: 3 });
+    const ab = benchmarkSearchSelection(createInitialState(), "search-alpha-beta-deterministic", { seed: 1, searchDepth: 3 });
+    expect(key(ab.selectedMove)).toBe(key(full.selectedMove));
+    expect(ab.score).toBe(full.score);
+    expect(ab.nodesSearched).toBeLessThanOrEqual(full.nodesSearched);
+    expect(ab.alphaBetaCutoffs).toBeGreaterThan(0);
+    expect({ selectedMove: key(ab.selectedMove), score: ab.score, fullNodes: full.nodesSearched, alphaBetaNodes: ab.nodesSearched, elapsedMs: ab.elapsedMs, cutoffCount: ab.alphaBetaCutoffs, cacheHitCount: ab.transpositionTableHits }).toBeTruthy();
   });
 });

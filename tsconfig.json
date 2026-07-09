@@ -3,7 +3,11 @@
     "target": "ES2020",
     "useDefineForClassFields": true,
     "module": "ESNext",
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2020",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "skipLibCheck": true,
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
@@ -17,5 +21,17 @@
     "forceConsistentCasingInFileNames": true,
     "exactOptionalPropertyTypes": false
   },
-  "include": ["src", "tests"]
+  "include": [
+    "src",
+    "simulator/agents.ts",
+    "simulator/mirror.ts",
+    "simulator-ui/src"
+  ],
+  "exclude": [
+    "tests",
+    "simulator/tests",
+    "simulator-ui/tests",
+    "simulator/opening-exploration.ts",
+    "simulator/validation.ts"
+  ]
 }
