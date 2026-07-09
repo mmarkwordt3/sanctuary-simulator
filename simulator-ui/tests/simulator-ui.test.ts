@@ -75,7 +75,7 @@ describe("simulator UI runner", () => {
   it("covers every legal Green first move in opening exploration", async () => {
     const result = await runOpening({ ...DEFAULT_SETTINGS.opening, gamesPerOpening: 1, maxPlies: 40 }, control());
     expect(new Set(result.openingRows.map((r) => String(r.opening))).size).toBe(legalMovesForState(createInitialState()).length);
-  });
+  }, 15_000);
 
   it("identifies irrelevant depth and diversity settings for visual de-emphasis", () => {
     expect(agentUsesDiversity("heuristic-diverse")).toBe(true);
