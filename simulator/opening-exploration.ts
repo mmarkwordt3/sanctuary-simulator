@@ -10,6 +10,7 @@ import {
   positionKey,
   type MoveRecord,
 } from "./agents.ts";
+import { canonicalLabel } from "./mirror.ts";
 import { summarize } from "./validation.ts";
 
 export interface OpeningExplorationConfig {
@@ -157,8 +158,9 @@ function replayVerify(moves: Move[], expected: ReturnType<typeof createInitialSt
 export function runOpeningExploration(config: OpeningExplorationConfig) {
   const openings = firstMoveLabels();
   const output: Record<string, unknown> = {};
-  let seed = config.seedStart;
-  for (const opening of openings) {
+  let pairIndex = 0;
+  for (const openingGroup of groupByCanonical(openings, (opening) => opening.label)) {
+  for (const opening of openingGroup) {
     const initial = createInitialState();
     const afterOpening = applyMove(initial, opening.move);
     const blueReplies = config.forceBlueReplies && afterOpening !== initial
@@ -176,7 +178,7 @@ export function runOpeningExploration(config: OpeningExplorationConfig) {
           prefix,
           config.green,
           config.blue,
-          seed++,
+          config.seedStart + pairIndex * config.gamesPerOpening + i,
           config.maxPlies,
           config.searchDepth ?? 2,
           config.diversity ?? 0,
@@ -185,6 +187,8 @@ export function runOpeningExploration(config: OpeningExplorationConfig) {
       replyOutput[reply.label] = summarize(games);
     }
     output[opening.label] = replyOutput;
+  }
+  pairIndex++;
   }
   return {
     config: {
@@ -199,6 +203,15 @@ export function runOpeningExploration(config: OpeningExplorationConfig) {
     openingsCovered: openings.length,
     results: output,
   };
+}
+
+function groupByCanonical<T>(items: T[], label: (item: T) => string): T[][] {
+  const groups = new Map<string, T[]>();
+  for (const item of items) {
+    const key = canonicalLabel(label(item));
+    groups.set(key, [...(groups.get(key) ?? []), item]);
+  }
+  return [...groups.values()];
 }
 
 if (import.meta.main) {

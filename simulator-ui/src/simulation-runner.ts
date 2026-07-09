@@ -10,6 +10,7 @@ import {
   positionKey,
   selectMoveDetailed,
 } from "../../simulator/agents.ts";
+import { canonicalLabel } from "../../simulator/mirror.ts";
 import { DEFAULT_SETTINGS, type OpeningSettings, type PositionSampling, type StandardSettings } from "./config.ts";
 import { jsonl, markdownSummary, toCsv, type ExportFile } from "./exporters.ts";
 
@@ -108,13 +109,15 @@ export async function runOpening(settings: OpeningSettings, control: RunnerContr
   const games: GameRecord[] = [];
   const positions: Array<Record<string, unknown>> = [];
   let id = 1;
-  for (const job of jobs) {
+  let pairIndex = 0;
+  for (const jobGroup of groupJobsByMirror(jobs)) {
+    for (const job of jobGroup) {
     for (let i = 0; i < settings.gamesPerOpening; i++) {
       await control.waitIfPaused();
       if (control.isCancelled()) break;
       games.push(playOne({
         id: id++,
-        seed: settings.seed + games.length,
+        seed: settings.seed + pairIndex * settings.gamesPerOpening + i,
         greenAgent: settings.greenAgent,
         blueAgent: settings.blueAgent,
         greenDiversity: settings.greenDiversity,
@@ -129,9 +132,21 @@ export async function runOpening(settings: OpeningSettings, control: RunnerContr
       control.onProgress({ ...progress(games, totalGames), currentOpening: job.opening });
     }
     if (control.isCancelled()) break;
+    }
+    pairIndex++;
+    if (control.isCancelled()) break;
   }
   const openingRows = summarizeOpenings(games, settings);
   return finalize(games, positions, openingRows, "opening", settings, control.isCancelled());
+}
+
+function groupJobsByMirror<T extends { opening: string; blueReply?: string }>(jobs: T[]): T[][] {
+  const groups = new Map<string, T[]>();
+  for (const job of jobs) {
+    const key = `${canonicalLabel(job.opening)}|${job.blueReply ? canonicalLabel(job.blueReply) : "normal-blue-response"}`;
+    groups.set(key, [...(groups.get(key) ?? []), job]);
+  }
+  return [...groups.values()];
 }
 
 interface PlayArgs {
