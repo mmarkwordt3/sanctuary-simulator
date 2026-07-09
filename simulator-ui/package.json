@@ -1,0 +1,12 @@
+{
+  "name": "sanctuary-simulator-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "bun test tests"
+  },
+  "dependencies": {}
+}
