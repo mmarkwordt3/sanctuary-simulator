@@ -1,0 +1,20 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; background: #f4efe5; color: #201a13; }
+header { padding: 2rem; background: #28422f; color: white; }
+main { display: grid; gap: 1rem; padding: 1rem; max-width: 1200px; margin: auto; }
+.card { background: rgba(255,255,255,.85); border: 1px solid #d6c8b4; border-radius: 12px; padding: 1rem; box-shadow: 0 2px 10px #0001; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .75rem; }
+label { display: grid; gap: .25rem; font-weight: 600; }
+input, select, button { font: inherit; padding: .45rem; border-radius: 8px; border: 1px solid #9f927e; }
+button { cursor: pointer; background: #315f3d; color: white; margin: .25rem; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+progress { width: 100%; height: 1.25rem; }
+.hidden { display: none; }
+.muted { opacity: .45; }
+.warning { background: #fff4c2; border-left: 4px solid #bf8f00; padding: .75rem; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .5rem; }
+.metrics div { background: #f6f6f6; padding: .5rem; border-radius: 8px; }
+.metrics span { display: block; overflow-wrap: anywhere; }
+table { width: 100%; border-collapse: collapse; overflow-x: auto; display: block; }
+th, td { border: 1px solid #ccc; padding: .4rem; text-align: left; white-space: nowrap; }
+@media (prefers-color-scheme: dark) { body { background: #1e1b16; color: #f4efe5; } .card { background: #2b261f; } .metrics div { background: #383126; } }
