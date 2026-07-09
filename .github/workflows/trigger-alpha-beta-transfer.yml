@@ -22,19 +22,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ ! -f .patch-transfer/ready ]; then
+            echo "Patch payload is not ready yet."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          python - <<'PY'
-          import base64, pathlib, re
-          text = pathlib.Path('.github/workflows/apply-alpha-beta-transfer.yml').read_text()
-          match = re.search(r"echo '([^']+)' \| base64 -d", text)
-          if not match:
-              raise SystemExit('Embedded patch archive not found')
-          pathlib.Path('/tmp/alpha-beta-patches.zip').write_bytes(base64.b64decode(match.group(1)))
-          PY
+          cat .patch-transfer/chunk-* > /tmp/alpha-beta-patches.b64
+          base64 -d /tmp/alpha-beta-patches.b64 > /tmp/alpha-beta-patches.zip
           unzip -q /tmp/alpha-beta-patches.zip -d /tmp/alpha-beta-patches
           git am /tmp/alpha-beta-patches/0001-Add-alpha-beta-search-and-targeted-opening-tests.patch /tmp/alpha-beta-patches/0002-Fix-alpha-beta-build-and-benchmark-validation.patch
-          rm .github/workflows/apply-alpha-beta-transfer.yml .github/workflows/trigger-alpha-beta-transfer.yml
+          rm -rf .patch-transfer
+          rm -f .github/workflows/apply-alpha-beta-transfer.yml .github/workflows/trigger-alpha-beta-transfer.yml
           git add -A
-          git commit -m "Remove transfer workflows"
+          git commit -m "Remove transfer scaffolding"
           git push origin HEAD:codex/add-alpha-beta-and-targeted-opening-mode
