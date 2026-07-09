@@ -1,0 +1,40 @@
+name: Trigger alpha-beta transfer on PR
+
+on:
+  pull_request:
+    branches:
+      - claude/strategy-game-continuation-us5q5v
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patches:
+    if: github.head_ref == 'codex/add-alpha-beta-and-targeted-opening-mode'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/add-alpha-beta-and-targeted-opening-mode
+
+      - name: Apply verified patch series
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python - <<'PY'
+          import base64, pathlib, re
+          text = pathlib.Path('.github/workflows/apply-alpha-beta-transfer.yml').read_text()
+          match = re.search(r"echo '([^']+)' \| base64 -d", text)
+          if not match:
+              raise SystemExit('Embedded patch archive not found')
+          pathlib.Path('/tmp/alpha-beta-patches.zip').write_bytes(base64.b64decode(match.group(1)))
+          PY
+          unzip -q /tmp/alpha-beta-patches.zip -d /tmp/alpha-beta-patches
+          git am /tmp/alpha-beta-patches/0001-Add-alpha-beta-search-and-targeted-opening-tests.patch /tmp/alpha-beta-patches/0002-Fix-alpha-beta-build-and-benchmark-validation.patch
+          rm .github/workflows/apply-alpha-beta-transfer.yml .github/workflows/trigger-alpha-beta-transfer.yml
+          git add -A
+          git commit -m "Remove transfer workflows"
+          git push origin HEAD:codex/add-alpha-beta-and-targeted-opening-mode
