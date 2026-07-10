@@ -99,3 +99,25 @@ describe("simulator UI runner", () => {
     expect(message.type).toBe("complete");
   });
 });
+
+import { readFileSync } from "node:fs";
+
+describe("simulator UI layout", () => {
+  it("keeps advanced move constraints collapsed and summarizes forced moves", () => {
+    const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    expect(source).toContain("<details id=\"advanced-constraints\">");
+    expect(source).toContain("Advanced move constraints");
+    expect(source).toContain("targeted-summary");
+    expect(source).toContain("if (!document.querySelector<HTMLDetailsElement>(\"#advanced-constraints\")?.open)");
+  });
+
+  it("keeps run controls in a sticky panel with visible progress", () => {
+    const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    expect(main).toContain("run-panel");
+    expect(main).toContain("sticky-progress-text");
+    expect(css).toContain("position: sticky");
+    expect(css).toContain("position: fixed");
+    expect(css).toContain(".scroll-list { max-height");
+  });
+});

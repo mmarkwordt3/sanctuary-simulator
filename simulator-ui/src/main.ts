@@ -17,16 +17,15 @@ const state: { settings: SimulatorUiSettings; worker: Worker | null; result: Run
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
   <header><h1>Sanctuary Simulator Lab</h1><p>Run local browser simulations without terminal commands or external APIs.</p></header>
-  <main>
+  <main class="app-shell"><div class="main-stack">
     <section class="card"><h2>1. Simulation mode</h2><label><input type="radio" name="mode" value="standard" checked> Standard self-play</label><label><input type="radio" name="mode" value="opening"> Opening exploration</label><label><input type="radio" name="mode" value="targeted"> Targeted Opening Test</label></section>
     <section id="standard" class="card"><h2>2. Standard self-play settings</h2><div class="grid" id="standard-fields"></div></section>
-    <section id="opening" class="card hidden"><h2>3. Opening-exploration settings</h2><p class="warning">Forcing every Green opening and every Blue reply can create a very large run.</p><div class="grid" id="opening-fields"></div></section><section id="targeted" class="card hidden"><h2>4. Targeted Opening Test</h2><p class="warning">Select Green openings and Blue replies, or use the suspected Blue Flag Bearer preset.</p><div class="grid" id="targeted-fields"></div><div id="targeted-moves"></div><p id="targeted-estimate"></p><button id="targeted-preset" type="button">Test suspected Blue Flag Bearer replies</button><button id="targeted-all" type="button">Select all</button><button id="targeted-clear" type="button">Clear</button><button id="targeted-mirror" type="button">Select mirror pair</button></section>
-    <section class="card"><h2>4. Run controls</h2><button id="start">Start</button><button id="pause" disabled>Pause</button><button id="resume" disabled>Resume</button><button id="cancel" disabled>Cancel</button><button id="reset">Reset</button></section>
-    <section class="card"><h2>5. Live progress</h2><progress id="bar" value="0" max="100"></progress><div id="progress-text">No run started.</div></section>
+    <section id="opening" class="card hidden"><h2>3. Opening-exploration settings</h2><p class="warning">Forcing every Green opening and every Blue reply can create a very large run.</p><div class="grid" id="opening-fields"></div></section><section id="targeted" class="card hidden"><h2>4. Targeted Opening Test</h2><p class="warning">Select Green openings and Blue replies, or use the suspected Blue Flag Bearer preset.</p><div class="grid" id="targeted-fields"></div><details id="advanced-constraints"><summary><span>Advanced move constraints</span><small id="targeted-summary">No forced moves selected.</small></summary><div class="advanced-actions"><button id="targeted-preset" type="button">Test suspected Blue Flag Bearer replies</button><button id="targeted-all" type="button">Select all</button><button id="targeted-clear" type="button">Clear</button><button id="targeted-mirror" type="button">Select mirror pair</button></div><div id="targeted-moves" class="scroll-list"></div></details><p id="targeted-estimate"></p></section>
+    <section class="card live-card"><h2>5. Live progress</h2><progress id="bar" value="0" max="100"></progress><div id="progress-text">No run started.</div></section>
     <section class="card"><h2>6. Results summary</h2><p class="warning">Simulation win rates measure these agents under the selected settings. They are not mathematical proof of game balance or a forced strategy.</p><div id="summary">No results yet.</div><div id="opening-table"></div></section>
     <section class="card"><h2>7. Downloads</h2><div id="downloads">Downloads appear after a completed or cancelled run.</div></section>
     <section class="card"><h2>8. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
-  </main>`;
+  </div><aside class="run-panel" aria-label="Run controls"><h2>Run Simulation</h2><button id="start">Start</button><button id="pause" disabled>Pause</button><button id="resume" disabled>Resume</button><button id="cancel" disabled>Cancel</button><button id="reset">Reset</button><div class="mini-progress"><progress id="sticky-bar" value="0" max="100"></progress><div id="sticky-progress-text">No run started.</div></div></aside></main>`;
 
 renderForms();
 wireEvents();
@@ -81,6 +80,7 @@ function wireEvents(): void {
   document.querySelector("#targeted-preset")!.addEventListener("click", () => { state.settings.targeted = suspectedBlueFlagBearerPreset(); renderForms(); updateApplicability(); });
   document.querySelector("#targeted-all")!.addEventListener("click", () => { const options = targetedOpeningOptions(); state.settings.targeted.selectedGreenOpenings = options.map((o) => o.label); state.settings.targeted.selectedBlueRepliesByOpening = Object.fromEntries(options.map((o) => [o.label, o.replies.map((r) => r.label)])); renderForms(); updateApplicability(); });
   document.querySelector("#targeted-clear")!.addEventListener("click", () => { state.settings.targeted.selectedGreenOpenings = []; state.settings.targeted.selectedBlueRepliesByOpening = {}; renderForms(); updateApplicability(); });
+  document.querySelector("#advanced-constraints")!.addEventListener("toggle", renderTargetedMoves);
   document.querySelector("#targeted-mirror")!.addEventListener("click", () => { const jobs = targetedOpeningOptions(); for (const opening of jobs) state.settings.targeted.selectedGreenOpenings = [...new Set([...state.settings.targeted.selectedGreenOpenings, opening.label])]; renderForms(); updateApplicability(); });
 }
 
@@ -101,6 +101,8 @@ function updateApplicability(): void {
   document.querySelector("#targeted")!.classList.toggle("hidden", state.settings.mode !== "targeted");
   const matchupCount = Object.values(state.settings.targeted.selectedBlueRepliesByOpening).reduce((n, a) => n + a.length, 0);
   document.querySelector("#targeted-estimate")!.textContent = `Estimated total games: ${matchupCount * state.settings.targeted.gamesPerMatchup}`;
+  const openingCount = state.settings.targeted.selectedGreenOpenings.length;
+  document.querySelector("#targeted-summary")!.textContent = openingCount || matchupCount ? `${openingCount} openings, ${matchupCount} replies selected` : "No forced moves selected.";
   for (const [agentId, divId] of [["std-green", "std-green-div"], ["std-blue", "std-blue-div"], ["op-green", "op-green-div"], ["op-blue", "op-blue-div"], ["tar-green", "tar-green-div"], ["tar-blue", "tar-blue-div"]]) {
     document.querySelector(`#${divId}`)?.closest("label")?.classList.toggle("muted", !agentUsesDiversity(agent(agentId)));
   }
@@ -132,7 +134,9 @@ function renderProgress(p: { completedGames: number; totalGames: number; greenWi
   const elapsed = (performance.now() - state.startedAt) / 1000;
   const eta = p.completedGames ? elapsed * (p.totalGames - p.completedGames) / p.completedGames : 0;
   document.querySelector<HTMLProgressElement>("#bar")!.value = pct;
+  document.querySelector<HTMLProgressElement>("#sticky-bar")!.value = pct;
   document.querySelector("#progress-text")!.textContent = `${p.completedGames}/${p.totalGames} (${pct.toFixed(1)}%) • elapsed ${elapsed.toFixed(1)}s • ETA ${eta.toFixed(1)}s • Green ${p.greenWins}, Blue ${p.blueWins}, Draws ${p.draws}, Replay failures ${p.replayFailures}${p.currentOpening ? ` • Opening ${p.currentOpening}` : ""}`;
+  document.querySelector("#sticky-progress-text")!.textContent = `${p.completedGames}/${p.totalGames} • ${pct.toFixed(1)}% • ${p.currentOpening ?? "running"}`;
 }
 
 function renderResult(result: RunResult): void {
@@ -164,6 +168,7 @@ function checked(id: string): boolean { return document.querySelector<HTMLInputE
 function renderTargetedMoves() {
   const el = document.querySelector("#targeted-moves"); if (!el) return;
   const options = targetedOpeningOptions();
+  if (!document.querySelector<HTMLDetailsElement>("#advanced-constraints")?.open) { el.innerHTML = ""; return; }
   el.innerHTML = options.map((o) => `<fieldset><legend><label><input type="checkbox" data-green="${o.label}" ${state.settings.targeted.selectedGreenOpenings.includes(o.label) ? "checked" : ""}>${o.label}</label></legend>${o.replies.map((r) => `<label><input type="checkbox" data-opening="${o.label}" data-reply="${r.label}" ${(state.settings.targeted.selectedBlueRepliesByOpening[o.label] ?? []).includes(r.label) ? "checked" : ""}>${r.label}</label>`).join("")}</fieldset>`).join("");
   el.querySelectorAll<HTMLInputElement>("input[data-green]").forEach((box) => box.onchange = () => { const label = box.dataset.green!; state.settings.targeted.selectedGreenOpenings = box.checked ? [...new Set([...state.settings.targeted.selectedGreenOpenings, label])] : state.settings.targeted.selectedGreenOpenings.filter((x) => x !== label); updateApplicability(); });
   el.querySelectorAll<HTMLInputElement>("input[data-reply]").forEach((box) => box.onchange = () => { const opening = box.dataset.opening!, reply = box.dataset.reply!; const current = state.settings.targeted.selectedBlueRepliesByOpening[opening] ?? []; state.settings.targeted.selectedBlueRepliesByOpening[opening] = box.checked ? [...new Set([...current, reply])] : current.filter((x) => x !== reply); updateApplicability(); });

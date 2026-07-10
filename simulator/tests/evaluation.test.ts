@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { toCoord } from "../../src/game/coords.ts";
 import type { GameState, Piece, PieceType, Player } from "../../src/game/types.ts";
-import { diagnosticBreakdown, positionKey, selectMoveDetailed } from "../agents.ts";
+import { diagnosticBreakdown, gateContainmentDiagnostic, positionKey, selectMoveDetailed } from "../agents.ts";
+import { mirrorState } from "../mirror.ts";
 
 let id = 0;
 function piece(type: PieceType, player: Player, at: string): Piece {
@@ -110,5 +111,73 @@ describe("objective-aware simulator evaluation", () => {
     expect(diverse.move).not.toBeNull();
     expect(diverse.legalMoveCount).toBeGreaterThan(0);
     expect(diverse.scoreLoss).toBeGreaterThanOrEqual(0);
+  });
+});
+
+function containmentFixture(at: string, overrides: Partial<GameState> = {}): GameState {
+  const blue = piece("flagBearer", "blue", at);
+  return state([
+    piece("engineer", "green", "M7"),
+    piece("guard", "green", "J7"),
+    blue,
+    piece("flagBearer", "green", "G1"),
+  ], { current: "green", flag: { square: null, carrierId: blue.id }, extractionTurnsRemaining: 3, ...overrides });
+}
+
+describe("carrier containment evaluation", () => {
+  it("penalizes opening a side gate for a Blue carrier on G9 with both gates closed", () => {
+    const closed = containmentFixture("G9");
+    const open = containmentFixture("G9", { walls: { west: true, east: false } });
+    expect(diagnosticBreakdown(closed, "green").carrierContainment).toBeGreaterThan(diagnosticBreakdown(open, "green").carrierContainment);
+  });
+
+  it("penalizes opening a side gate for a Blue carrier on G7 carrying the flag", () => {
+    const closed = containmentFixture("G7");
+    const open = containmentFixture("G7", { walls: { west: false, east: true } });
+    expect(score(closed)).toBeGreaterThan(score(open));
+  });
+
+  it("recognizes danger when exactly one gate is open", () => {
+    const oneOpen = containmentFixture("H7", { walls: { west: false, east: true }, extractionTurnsRemaining: 2 });
+    expect(diagnosticBreakdown(oneOpen, "green").carrierContainment).toBeLessThan(diagnosticBreakdown(containmentFixture("H7"), "green").carrierContainment);
+  });
+
+  it("chooses defensive development over an immediate harmful gate opening", () => {
+    const s = containmentFixture("G7");
+    const selected = selectMoveDetailed(s, "heuristic-deterministic", { seed: 4 });
+    const moving = s.pieces.find((p) => p.id === selected.move?.pieceId)!;
+    expect(moving.type === "engineer" && selected.move?.to.col === toCoord("M7").col).toBe(false);
+  });
+
+  it("rewards one move remaining before extraction failure", () => {
+    const one = containmentFixture("G7", { extractionTurnsRemaining: 1 });
+    const three = containmentFixture("G7", { extractionTurnsRemaining: 3 });
+    expect(diagnosticBreakdown(one, "green").carrierContainment).toBeGreaterThan(diagnosticBreakdown(three, "green").carrierContainment);
+  });
+
+  it("diagnoses a gate opening that gives Blue an immediate escape", () => {
+    const before = containmentFixture("H7");
+    const after = containmentFixture("H7", { walls: { west: true, east: false } });
+    const d = gateContainmentDiagnostic(before, after, "green")!;
+    expect(d.gateOpenedWhileEnemyFlagBearerInside).toBe(true);
+    expect(d.reducedEstimatedShortestRouteToSafety).toBe(true);
+    expect(d.containmentDelta).toBeLessThan(0);
+  });
+
+  it("does not excessively penalize a gate opening that does not improve escape distance", () => {
+    const far = state([piece("engineer", "green", "M7"), piece("flagBearer", "blue", "G13")], { current: "green" });
+    const open = state(far.pieces, { current: "green", walls: { west: false, east: true } });
+    expect(Math.abs(diagnosticBreakdown(open, "green").carrierContainment - diagnosticBreakdown(far, "green").carrierContainment)).toBeLessThan(1000);
+  });
+
+  it("mirrored carrier danger produces the same containment evaluation", () => {
+    const s = containmentFixture("F7", { walls: { west: false, east: true } });
+    expect(diagnosticBreakdown(s, "green").carrierContainment).toBe(diagnosticBreakdown(mirrorState(s), "green").carrierContainment);
+  });
+
+  it("evaluates alternative carrier routes without relying on G9 to G7", () => {
+    const alt = containmentFixture("H6", { extractionTurnsRemaining: 2 });
+    const open = containmentFixture("H6", { walls: { west: true, east: false }, extractionTurnsRemaining: 2 });
+    expect(diagnosticBreakdown(alt, "green").carrierContainment).toBeGreaterThan(diagnosticBreakdown(open, "green").carrierContainment);
   });
 });

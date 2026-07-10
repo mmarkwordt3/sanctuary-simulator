@@ -18,3 +18,17 @@ progress { width: 100%; height: 1.25rem; }
 table { width: 100%; border-collapse: collapse; overflow-x: auto; display: block; }
 th, td { border: 1px solid #ccc; padding: .4rem; text-align: left; white-space: nowrap; }
 @media (prefers-color-scheme: dark) { body { background: #1e1b16; color: #f4efe5; } .card { background: #2b261f; } .metrics div { background: #383126; } }
+.app-shell { display: grid; grid-template-columns: minmax(0, 1fr) 280px; align-items: start; }
+.main-stack { display: grid; gap: 1rem; min-width: 0; }
+.run-panel { position: sticky; top: 1rem; background: rgba(255,255,255,.92); border: 1px solid #d6c8b4; border-radius: 12px; padding: 1rem; box-shadow: 0 2px 10px #0001; }
+.run-panel button { width: 100%; margin: .25rem 0; }
+.mini-progress { margin-top: .75rem; font-size: .9rem; }
+.live-card { min-height: 5.5rem; }
+details#advanced-constraints { border: 1px solid #d6c8b4; border-radius: 10px; padding: .75rem; }
+details#advanced-constraints summary { cursor: pointer; display: flex; justify-content: space-between; gap: 1rem; font-weight: 700; }
+details#advanced-constraints summary small { font-weight: 500; opacity: .75; }
+.advanced-actions { margin: .75rem 0; }
+.scroll-list { max-height: 24rem; overflow: auto; border-top: 1px solid #d6c8b4; padding-top: .5rem; }
+.scroll-list fieldset { margin: .5rem 0; border: 1px solid #d6c8b4; border-radius: 8px; }
+@media (max-width: 860px) { .app-shell { grid-template-columns: 1fr; padding-bottom: 10rem; } .run-panel { position: fixed; left: 0; right: 0; bottom: 0; top: auto; z-index: 10; border-radius: 12px 12px 0 0; display: grid; grid-template-columns: repeat(5, 1fr); gap: .35rem; } .run-panel h2, .mini-progress { grid-column: 1 / -1; margin: 0; } }
+@media (prefers-color-scheme: dark) { .run-panel { background: #2b261f; } }

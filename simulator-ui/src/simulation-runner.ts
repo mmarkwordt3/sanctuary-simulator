@@ -9,6 +9,7 @@ import {
   legalMovesForState,
   positionKey,
   selectMoveDetailed,
+  gateContainmentDiagnostic,
 } from "../../simulator/agents.ts";
 import { canonicalLabel } from "../../simulator/mirror.ts";
 import { DEFAULT_SETTINGS, type OpeningSettings, type PositionSampling, type StandardSettings, type TargetedOpeningSettings } from "./config.ts";
@@ -61,6 +62,7 @@ export interface GameRecord {
   pickupPly?: number;
   extractionFailure?: boolean;
   carrierRouted?: boolean;
+  gateContainmentDiagnostics: Array<Record<string, unknown>>;
   metrics: Metrics;
 }
 
@@ -76,6 +78,11 @@ export interface Metrics {
   illegalMoves: number;
   diversityChanges: number;
   diversityScoreLoss: number;
+  gateOpenedWithEnemyCarrierInside: number;
+  gateOpenedWithEnemyCarrierFlag: number;
+  gateOpenImmediateEscapeRoutes: number;
+  gateOpenReducedEscapeDistance: number;
+  carrierContainmentDelta: number;
 }
 
 export interface RunResult {
@@ -262,11 +269,17 @@ function playOne(args: PlayArgs): GameRecord {
     illegalMoves: 0,
     diversityChanges: 0,
     diversityScoreLoss: 0,
+    gateOpenedWithEnemyCarrierInside: 0,
+    gateOpenedWithEnemyCarrierFlag: 0,
+    gateOpenImmediateEscapeRoutes: 0,
+    gateOpenReducedEscapeDistance: 0,
+    carrierContainmentDelta: 0,
   };
+  const gateDiagnostics: Array<Record<string, unknown>> = [];
 
   for (const forced of args.forcedPrefix ?? []) {
     const beforeCarrier = state.flag.carrierId;
-    const applied = applyTrackedMove(state, forced, moves, labels, metrics);
+    const applied = applyTrackedMove(state, forced, moves, labels, metrics, gateDiagnostics);
     if (!applied) { metrics.illegalMoves++; break; }
     previousMove = applied.previousMove;
     state = applied.state;
@@ -301,7 +314,7 @@ function playOne(args: PlayArgs): GameRecord {
       metrics.diversityScoreLoss += selection.scoreLoss;
     }
     const beforeCarrier = state.flag.carrierId;
-    const applied = applyTrackedMove(state, selection.move, moves, labels, metrics);
+    const applied = applyTrackedMove(state, selection.move, moves, labels, metrics, gateDiagnostics);
     if (!applied) { metrics.illegalMoves++; break; }
     previousMove = applied.previousMove;
     state = applied.state;
@@ -341,11 +354,12 @@ function playOne(args: PlayArgs): GameRecord {
     pickupPly,
     extractionFailure: metrics.extractionFailures > 0,
     carrierRouted: metrics.ladenFlagBearerRoutings > 0,
+    gateContainmentDiagnostics: gateDiagnostics,
     metrics,
   };
 }
 
-function applyTrackedMove(state: GameState, move: Move, moves: Move[], labels: string[], metrics: Metrics) {
+function applyTrackedMove(state: GameState, move: Move, moves: Move[], labels: string[], metrics: Metrics, gateDiagnostics: Array<Record<string, unknown>>) {
   const piece = state.pieces.find((p) => p.id === move.pieceId);
   if (!piece) return null;
   const beforeHistory = state.history.length;
@@ -354,7 +368,18 @@ function applyTrackedMove(state: GameState, move: Move, moves: Move[], labels: s
   const next = applyMove(state, move);
   if (next === state) return null;
   const events = next.history.slice(beforeHistory).join(" | ");
-  if (/Wall removed/.test(events)) metrics.sideGatesOpened++;
+  if (/Wall removed/.test(events)) {
+    metrics.sideGatesOpened++;
+    const diagnostic = gateContainmentDiagnostic(state, next, piece.player);
+    if (diagnostic) {
+      metrics.gateOpenedWithEnemyCarrierInside += Number(diagnostic.gateOpenedWhileEnemyFlagBearerInside);
+      metrics.gateOpenedWithEnemyCarrierFlag += Number(diagnostic.enemyFlagBearerCarryingFlag);
+      metrics.gateOpenImmediateEscapeRoutes += Number(diagnostic.immediateLegalEscapeRouteCreated);
+      metrics.gateOpenReducedEscapeDistance += Number(diagnostic.reducedEstimatedShortestRouteToSafety);
+      metrics.carrierContainmentDelta += diagnostic.containmentDelta;
+      gateDiagnostics.push({ ply: moves.length + 1, mover: piece.player, move: `${move.pieceId}:${fromCoord(from)}-${fromCoord(move.to)}`, ...diagnostic });
+    }
+  }
   if (/entered the Sanctuary/.test(events)) metrics.sanctuaryEntries++;
   if (/took the flag/.test(events)) {
     metrics.flagPickups++;
@@ -427,6 +452,11 @@ export function summarizeRecords(games: GameRecord[]) {
     illegalMoves: metric("illegalMoves"),
     replayFailures: games.filter((g) => !g.replayOk).length,
     diversityChanges,
+    gateOpenedWithEnemyCarrierInside: metric("gateOpenedWithEnemyCarrierInside"),
+    gateOpenedWithEnemyCarrierFlag: metric("gateOpenedWithEnemyCarrierFlag"),
+    gateOpenImmediateEscapeRoutes: metric("gateOpenImmediateEscapeRoutes"),
+    gateOpenReducedEscapeDistance: metric("gateOpenReducedEscapeDistance"),
+    carrierContainmentDelta: Number(metric("carrierContainmentDelta").toFixed(2)),
     averageDiversityScoreLoss: Number((metric("diversityScoreLoss") / Math.max(1, diversityChanges)).toFixed(2)),
   };
 }
@@ -458,7 +488,7 @@ function finalize(games: GameRecord[], positions: Array<Record<string, unknown>>
     cancelled,
     allReplayVerified: summary.replayFailures === 0,
   };
-  const summaryRows = games.map((g) => ({ id: g.id, seed: g.seed, winner: g.winner ?? "draw", drawReason: g.drawReason, plies: g.plies, replayOk: g.replayOk, opening: g.opening, forcedGreenOpening: g.forcedGreenOpening, forcedBlueReply: g.forcedBlueReply, greenOpeningLabel: g.greenOpeningLabel, blueReplyLabel: g.blueReplyLabel, matchupId: g.matchupId, mirrorPairId: g.mirrorPairId, requestedSearchDepth: g.requestedSearchDepth, completedSearchDepth: g.completedSearchDepth, nodesSearched: g.nodesSearched, leafEvaluations: g.leafEvaluations, alphaBetaCutoffs: g.alphaBetaCutoffs, transpositionTableHits: g.transpositionTableHits, searchElapsedMs: g.searchElapsedMs, timedOut: g.timedOut, principalVariation: g.principalVariation, firstPickupPlayer: g.firstPickupPlayer, pickupPly: g.pickupPly, extractionFailure: g.extractionFailure, carrierRouted: g.carrierRouted }));
+  const summaryRows = games.map((g) => ({ id: g.id, seed: g.seed, winner: g.winner ?? "draw", drawReason: g.drawReason, plies: g.plies, replayOk: g.replayOk, opening: g.opening, forcedGreenOpening: g.forcedGreenOpening, forcedBlueReply: g.forcedBlueReply, greenOpeningLabel: g.greenOpeningLabel, blueReplyLabel: g.blueReplyLabel, matchupId: g.matchupId, mirrorPairId: g.mirrorPairId, requestedSearchDepth: g.requestedSearchDepth, completedSearchDepth: g.completedSearchDepth, nodesSearched: g.nodesSearched, leafEvaluations: g.leafEvaluations, alphaBetaCutoffs: g.alphaBetaCutoffs, transpositionTableHits: g.transpositionTableHits, searchElapsedMs: g.searchElapsedMs, timedOut: g.timedOut, principalVariation: g.principalVariation, gateContainmentDiagnostics: JSON.stringify(g.gateContainmentDiagnostics), firstPickupPlayer: g.firstPickupPlayer, pickupPly: g.pickupPly, extractionFailure: g.extractionFailure, carrierRouted: g.carrierRouted }));
   const files: ExportFile[] = [
     { name: "games.jsonl", mime: "application/x-ndjson", content: jsonl(games) },
     { name: "positions.jsonl", mime: "application/x-ndjson", content: jsonl(positions) },
