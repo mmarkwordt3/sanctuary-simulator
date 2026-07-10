@@ -71,3 +71,11 @@ describe("alpha-beta search", () => {
     expect({ selectedMove: key(ab.selectedMove), score: ab.score, fullNodes: full.nodesSearched, alphaBetaNodes: ab.nodesSearched, elapsedMs: ab.elapsedMs, cutoffCount: ab.alphaBetaCutoffs, cacheHitCount: ab.transpositionTableHits }).toBeTruthy();
   });
 });
+
+it("maintains representative depth-4 alpha-beta performance with containment evaluation", () => {
+  const result = selectMoveDetailed(createInitialState(), "search-alpha-beta-deterministic", { seed: 101, searchDepth: 4, timeLimitMs: 15_000 });
+  expect(result.diagnostics?.completedDepth).toBe(4);
+  expect(result.diagnostics?.nodesSearched).toBeGreaterThan(0);
+  const evalsPerSecond = (result.diagnostics!.leafEvaluations / Math.max(1, result.diagnostics!.elapsedMs)) * 1000;
+  expect(evalsPerSecond).toBeGreaterThan(200);
+}, 20_000);

@@ -46,6 +46,7 @@ export interface EvaluationBreakdown {
   forcedDeparture: number;
   homewardCarrierProgress: number;
   carrierSafety: number;
+  carrierContainment: number;
   mobility: number;
   repetitionPenalty: number;
   total: number;
@@ -106,6 +107,15 @@ export const EVALUATION_WEIGHTS = {
   postExtraction: 3_000,
   homeDistance: 320,
   carrierProtection: 28,
+  enemyCarrierDanger: 1_450,
+  enemyCarrierFlagThreat: 1_250,
+  closedGateContainment: 700,
+  openGateEscapePenalty: 1_650,
+  carrierExitDistance: 420,
+  carrierExtractionFailurePressure: 520,
+  controlledExit: 260,
+  routerNearCarrier: 170,
+  carrierHomeApproach: 220,
   mobilityStep: 4,
   repeatedPosition: -650,
   immediateReversal: -450,
@@ -141,6 +151,97 @@ function cannonTargetsForClosedGates(state: GameState): Coord[] {
 function minDistance(c: Coord, targets: Coord[]): number {
   if (targets.length === 0) return 0;
   return Math.min(...targets.map((t) => chebyshev(c, t)));
+}
+
+
+function flagBearerFor(state: GameState, player: Player): Piece | undefined {
+  return state.pieces.find((p) => p.player === player && p.type === "flagBearer");
+}
+
+function isCarryingFlag(state: GameState, piece: Piece | undefined): boolean {
+  return !!piece && state.flag.carrierId === piece.id;
+}
+
+function canTakeFlagImmediately(state: GameState, bearer: Piece | undefined): boolean {
+  if (!bearer || state.flag.carrierId || !state.flag.square) return false;
+  return chebyshev(bearer, state.flag.square) <= 1 && (isInnerCircle(bearer) || SANCTUARY_ENTRANCES.some((g) => chebyshev(bearer, g) <= 1));
+}
+
+function nearestExitDistance(state: GameState, bearer: Piece | undefined, onlyOpen = true): number {
+  if (!bearer) return 99;
+  const exits = onlyOpen ? openSideGates(state) : SIDE_GATES;
+  if (!exits.length) return 99;
+  return minDistance(bearer, exits);
+}
+
+function likelyExitControlled(state: GameState, defender: Player): number {
+  const exits = openSideGates(state);
+  return exits.reduce((n, gate) => n + (state.pieces.some((p) => p.player === defender && chebyshev(p, gate) <= 2) ? 1 : 0), 0);
+}
+
+function carrierContainmentScore(state: GameState, perspective: Player): number {
+  const enemy: Player = perspective === "green" ? "blue" : "green";
+  const carrier = flagBearerFor(state, enemy);
+  if (!carrier) return 0;
+  const inside = isInnerCircle(carrier) || SANCTUARY_ENTRANCES.some((g) => g.col === carrier.col && g.row === carrier.row);
+  const carrying = isCarryingFlag(state, carrier);
+  const pickupThreat = canTakeFlagImmediately(state, carrier);
+  if (!inside && !carrying && !pickupThreat) return 0;
+
+  const open = openSideGates(state).length;
+  const openDistance = nearestExitDistance(state, carrier, true);
+  const anyGateDistance = nearestExitDistance(state, carrier, false);
+  const defendersNear = state.pieces.filter((p) => p.player === perspective && chebyshev(p, carrier) <= 2).length;
+  const timer = state.extractionTurnsRemaining ?? (carrying ? Math.max(0, 4 - anyGateDistance) : 0);
+  let score = 0;
+
+  score += (2 - open) * EVALUATION_WEIGHTS.closedGateContainment;
+  if (inside || pickupThreat) score += EVALUATION_WEIGHTS.enemyCarrierDanger;
+  if (carrying || pickupThreat) score += EVALUATION_WEIGHTS.enemyCarrierFlagThreat;
+  if (open > 0) score -= EVALUATION_WEIGHTS.openGateEscapePenalty * open;
+  if (openDistance < 99) score += openDistance * EVALUATION_WEIGHTS.carrierExitDistance;
+  score += (4 - Math.min(4, timer)) * EVALUATION_WEIGHTS.carrierExtractionFailurePressure;
+  score += likelyExitControlled(state, perspective) * EVALUATION_WEIGHTS.controlledExit;
+  score += defendersNear * EVALUATION_WEIGHTS.routerNearCarrier;
+  if (carrying && !inside && state.extractionTurnsRemaining === null) score -= (12 - chebyshev(carrier, victorySquare(enemy))) * EVALUATION_WEIGHTS.carrierHomeApproach;
+  return score;
+}
+
+export interface GateContainmentDiagnostic {
+  gateOpenedWhileEnemyFlagBearerInside: boolean;
+  enemyFlagBearerCarryingFlag: boolean;
+  immediateLegalEscapeRouteCreated: boolean;
+  reducedEstimatedShortestRouteToSafety: boolean;
+  containmentDelta: number;
+  beforeContainmentScore: number;
+  afterContainmentScore: number;
+  remainingSanctuaryTimer: number | null;
+  estimatedCarrierExitDistanceBefore: number;
+  estimatedCarrierExitDistanceAfter: number;
+}
+
+export function gateContainmentDiagnostic(before: GameState, after: GameState, player: Player): GateContainmentDiagnostic | null {
+  const enemy: Player = player === "green" ? "blue" : "green";
+  const enemyBearer = flagBearerFor(before, enemy);
+  const openedGate = after.walls.west !== before.walls.west || after.walls.east !== before.walls.east;
+  if (!openedGate || !enemyBearer) return null;
+  const afterBearer = flagBearerFor(after, enemy);
+  const beforeDistance = nearestExitDistance(before, enemyBearer, true);
+  const afterDistance = nearestExitDistance(after, afterBearer, true);
+  const beforeScore = carrierContainmentScore(before, player);
+  const afterScore = carrierContainmentScore(after, player);
+  return {
+    gateOpenedWhileEnemyFlagBearerInside: isInnerCircle(enemyBearer) || SANCTUARY_ENTRANCES.some((g) => g.col === enemyBearer.col && g.row === enemyBearer.row),
+    enemyFlagBearerCarryingFlag: isCarryingFlag(before, enemyBearer),
+    immediateLegalEscapeRouteCreated: beforeDistance >= 99 && afterDistance <= 1,
+    reducedEstimatedShortestRouteToSafety: afterDistance < beforeDistance,
+    containmentDelta: afterScore - beforeScore,
+    beforeContainmentScore: beforeScore,
+    afterContainmentScore: afterScore,
+    remainingSanctuaryTimer: before.extractionTurnsRemaining,
+    estimatedCarrierExitDistanceBefore: beforeDistance,
+    estimatedCarrierExitDistanceAfter: afterDistance,
+  };
 }
 
 function allLegalMoves(state: GameState): Move[] {
@@ -209,6 +310,7 @@ export function evaluateState(
     forcedDeparture: 0,
     homewardCarrierProgress: 0,
     carrierSafety: 0,
+    carrierContainment: 0,
     mobility: 0,
     repetitionPenalty: 0,
     total: 0,
@@ -280,6 +382,8 @@ export function evaluateState(
   if (state.extractionTurnsRemaining !== null && carrier && state.current === carrier.player) {
     b.extractionUrgency += signed(player, carrier.player, EVALUATION_WEIGHTS.nonCarrierExtractionMove);
   }
+
+  b.carrierContainment = carrierContainmentScore(state, player);
 
   const currentMobility = allLegalMoves(state).length;
   b.mobility = signed(player, state.current, currentMobility * EVALUATION_WEIGHTS.mobilityStep);
