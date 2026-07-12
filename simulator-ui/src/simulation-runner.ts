@@ -37,7 +37,7 @@ export interface GameRecord {
   greenAgent: AgentName;
   blueAgent: AgentName;
   winner: string | null;
-  drawReason: "maxPlies" | "cancelled" | "noLegalMove" | null;
+  drawReason: "max-plies" | "maxPlies" | "cancelled" | "noLegalMove" | "threefold-repetition" | "no-progress" | null;
   plies: number;
   replayOk: boolean;
   moves: string[];
@@ -63,7 +63,24 @@ export interface GameRecord {
   extractionFailure?: boolean;
   carrierRouted?: boolean;
   gateContainmentDiagnostics: Array<Record<string, unknown>>;
+  repetitionDiagnostics: RepetitionDiagnostics;
+  selectedMoveDiagnostics: Array<Record<string, unknown>>;
   metrics: Metrics;
+}
+
+export interface RepetitionDiagnostics {
+  uniquePositionsVisited: number;
+  repeatedPositionsCount: number;
+  maximumRepetitionCount: number;
+  immediateReversals: number;
+  twoPlyCycles: number;
+  fourPlyCycles: number;
+  noProgressPlies: number;
+  longestNoProgressStreak: number;
+  repetitionDraw: boolean;
+  noProgressDraw: boolean;
+  firstRepeatingCyclePly: number | null;
+  drawReason: string | null;
 }
 
 export interface Metrics {
@@ -112,6 +129,7 @@ export async function runStandard(settings: StandardSettings, control: RunnerCon
       blueDiversity: settings.blueDiversity,
       searchDepth: settings.searchDepth,
       maxPlies: settings.maxPlies,
+      noProgressPlyLimit: settings.noProgressPlyLimit ?? 40,
       positionSampling: settings.positionSampling,
       positions,
     }));
@@ -165,7 +183,7 @@ export async function runTargetedOpening(settings: TargetedOpeningSettings, cont
     for (const job of jobGroup) for (let i = 0; i < settings.gamesPerMatchup; i++) {
       await control.waitIfPaused();
       if (control.isCancelled()) break;
-      games.push(playOne({ id: id++, seed: settings.seed + games.length, greenAgent: settings.greenAgent, blueAgent: settings.blueAgent, greenDiversity: settings.greenDiversity, blueDiversity: settings.blueDiversity, searchDepth: settings.searchDepth, timeLimitMs: settings.timeLimitMs, maxPlies: settings.maxPlies, positionSampling: settings.positionSampling, positions, forcedPrefix: job.prefix, opening: job.opening, forcedGreenOpening: job.opening, forcedBlueReply: job.blueReply, matchupId: job.matchupId, mirrorPairId: job.mirrorPairId }));
+      games.push(playOne({ id: id++, seed: settings.seed + games.length, greenAgent: settings.greenAgent, blueAgent: settings.blueAgent, greenDiversity: settings.greenDiversity, blueDiversity: settings.blueDiversity, searchDepth: settings.searchDepth, timeLimitMs: settings.timeLimitMs, maxPlies: settings.maxPlies, noProgressPlyLimit: settings.noProgressPlyLimit ?? 40, positionSampling: settings.positionSampling, positions, forcedPrefix: job.prefix, opening: job.opening, forcedGreenOpening: job.opening, forcedBlueReply: job.blueReply, matchupId: job.matchupId, mirrorPairId: job.mirrorPairId }));
       control.onProgress({ ...progress(games, totalGames), currentOpening: job.opening });
     }
     if (control.isCancelled()) break;
@@ -203,6 +221,7 @@ export async function runOpening(settings: OpeningSettings, control: RunnerContr
         blueDiversity: settings.blueDiversity,
         searchDepth: settings.searchDepth,
         maxPlies: settings.maxPlies,
+        noProgressPlyLimit: settings.noProgressPlyLimit ?? 40,
         positionSampling: settings.positionSampling,
         positions,
         forcedPrefix: job.prefix,
@@ -237,6 +256,7 @@ interface PlayArgs {
   blueDiversity: DiversityLevel;
   searchDepth: number;
   maxPlies: number;
+  noProgressPlyLimit: number;
   positionSampling: PositionSampling;
   positions: Array<Record<string, unknown>>;
   forcedPrefix?: Move[];
@@ -248,10 +268,40 @@ interface PlayArgs {
   mirrorPairId?: string;
 }
 
+export function runForcedLineForRepetitionTest(forcedPrefix: Move[], maxPlies = 100, noProgressPlyLimit = 40): GameRecord {
+  return playOne({
+    id: 1,
+    seed: 1,
+    greenAgent: "random",
+    blueAgent: "random",
+    greenDiversity: 0,
+    blueDiversity: 0,
+    searchDepth: 1,
+    maxPlies,
+    noProgressPlyLimit,
+    positionSampling: "none",
+    positions: [],
+    forcedPrefix,
+  });
+}
+
 function playOne(args: PlayArgs): GameRecord {
   let state = createInitialState();
   const seen = new Map<string, number>();
+  seen.set(positionKey(state), 1);
   let previousMove: MoveRecord | null = null;
+  const lastMoveByPiece = new Map<string, MoveRecord>();
+  let noProgressPlies = 0;
+  let longestNoProgressStreak = 0;
+  let repeatedPositionsCount = 0;
+  let maximumRepetitionCount = 1;
+  let immediateReversals = 0;
+  let twoPlyCycles = 0;
+  let fourPlyCycles = 0;
+  let firstRepeatingCyclePly: number | null = null;
+  let drawReason: GameRecord["drawReason"] = null;
+  const positionTimeline = [positionKey(state)];
+  const selectedMoveDiagnostics: Array<Record<string, unknown>> = [];
   const moves: Move[] = [];
   const labels: string[] = [];
   let searchDiagnostics = { completedSearchDepth: 0, nodesSearched: 0, leafEvaluations: 0, alphaBetaCutoffs: 0, transpositionTableHits: 0, searchElapsedMs: 0, timedOut: false, principalVariation: "" };
@@ -277,19 +327,39 @@ function playOne(args: PlayArgs): GameRecord {
   };
   const gateDiagnostics: Array<Record<string, unknown>> = [];
 
+  const recordRepetition = (progressed: boolean, reversed: boolean): boolean => {
+    const nextKey = positionKey(state);
+    const previousCount = seen.get(nextKey) ?? 0;
+    noProgressPlies = progressed ? 0 : noProgressPlies + 1;
+    longestNoProgressStreak = Math.max(longestNoProgressStreak, noProgressPlies);
+    if (reversed) immediateReversals++;
+    if (positionTimeline.length >= 2 && nextKey === positionTimeline[positionTimeline.length - 2]) { twoPlyCycles++; if (firstRepeatingCyclePly === null) firstRepeatingCyclePly = moves.length; }
+    if (positionTimeline.length >= 4 && nextKey === positionTimeline[positionTimeline.length - 4]) { fourPlyCycles++; if (firstRepeatingCyclePly === null) firstRepeatingCyclePly = moves.length; }
+    if (previousCount > 0) repeatedPositionsCount++;
+    seen.set(nextKey, previousCount + 1);
+    maximumRepetitionCount = Math.max(maximumRepetitionCount, previousCount + 1);
+    positionTimeline.push(nextKey);
+    selectedMoveDiagnostics.push({ ply: moves.length, move: labels[labels.length - 1], returnedToRecentPosition: previousCount > 0, repetitionCountAfterMove: previousCount + 1, reversedPreviousMove: reversed, nonProgressPenaltyApplied: progressed ? 0 : noProgressPlies * -18, repetitionPenaltyApplied: previousCount >= 2 ? -700 : previousCount === 1 ? -180 : 0 });
+    if (!progressed && previousCount + 1 >= 3) { drawReason = "threefold-repetition"; return true; }
+    if (noProgressPlies >= args.noProgressPlyLimit) { drawReason = "no-progress"; return true; }
+    return false;
+  };
+
   for (const forced of args.forcedPrefix ?? []) {
     const beforeCarrier = state.flag.carrierId;
+    const reversed = isRunnerImmediateReversal(lastMoveByPiece.get(forced.pieceId) ?? null, forced, state);
     const applied = applyTrackedMove(state, forced, moves, labels, metrics, gateDiagnostics);
     if (!applied) { metrics.illegalMoves++; break; }
     previousMove = applied.previousMove;
+    lastMoveByPiece.set(applied.previousMove.pieceId, applied.previousMove);
     state = applied.state;
     if (!beforeCarrier && state.flag.carrierId && !firstPickupPlayer) { firstPickupPlayer = previousMove.pieceId.startsWith("G") ? "green" : "blue"; pickupPly = moves.length; }
+    if (recordRepetition(applied.meaningfulProgress, reversed)) break;
   }
 
-  while (!state.winner && moves.length < args.maxPlies && metrics.illegalMoves === 0) {
+  while (!drawReason && !state.winner && moves.length < args.maxPlies && metrics.illegalMoves === 0) {
     const agent = state.current === "green" ? args.greenAgent : args.blueAgent;
     const diversity = state.current === "green" ? args.greenDiversity : args.blueDiversity;
-    seen.set(positionKey(state), (seen.get(positionKey(state)) ?? 0) + 1);
     const selection = selectMoveDetailed(state, agent, {
       seed: args.seed + moves.length * 7919 + (state.current === "green" ? 0 : 31337),
       recentPositions: seen,
@@ -297,6 +367,7 @@ function playOne(args: PlayArgs): GameRecord {
       searchDepth: args.searchDepth,
       diversity,
       timeLimitMs: args.timeLimitMs,
+      currentNoProgressPlies: noProgressPlies,
     });
     if (!selection.move) break;
     if (selection.diagnostics) {
@@ -314,15 +385,21 @@ function playOne(args: PlayArgs): GameRecord {
       metrics.diversityScoreLoss += selection.scoreLoss;
     }
     const beforeCarrier = state.flag.carrierId;
+    const beforeScore = selection.candidates.find((c) => c.move === selection.move)?.breakdown.total ?? null;
+    const reversed = isRunnerImmediateReversal(lastMoveByPiece.get(selection.move.pieceId) ?? previousMove, selection.move, state);
     const applied = applyTrackedMove(state, selection.move, moves, labels, metrics, gateDiagnostics);
     if (!applied) { metrics.illegalMoves++; break; }
     previousMove = applied.previousMove;
+    lastMoveByPiece.set(applied.previousMove.pieceId, applied.previousMove);
     state = applied.state;
     if (!beforeCarrier && state.flag.carrierId && !firstPickupPlayer) { firstPickupPlayer = previousMove.pieceId.startsWith("G") ? "green" : "blue"; pickupPly = moves.length; }
+    if (recordRepetition(applied.meaningfulProgress, reversed)) break;
+    selectedMoveDiagnostics[selectedMoveDiagnostics.length - 1].objectiveProgressScoreDelta = beforeScore;
     if (args.positionSampling === "every-ply") args.positions.push(positionRecord(args.id, moves.length, state));
   }
   if (args.positionSampling === "final") args.positions.push(positionRecord(args.id, moves.length, state));
-  const drawReason = state.winner ? null : moves.length >= args.maxPlies ? "maxPlies" : "noLegalMove";
+  drawReason = state.winner ? null : drawReason ?? (moves.length >= args.maxPlies ? "max-plies" : "noLegalMove");
+  const repetitionDiagnostics: RepetitionDiagnostics = { uniquePositionsVisited: seen.size, repeatedPositionsCount, maximumRepetitionCount, immediateReversals, twoPlyCycles, fourPlyCycles, noProgressPlies, longestNoProgressStreak, repetitionDraw: String(drawReason) === "threefold-repetition", noProgressDraw: String(drawReason) === "no-progress", firstRepeatingCyclePly, drawReason };
   return {
     id: args.id,
     seed: args.seed,
@@ -355,6 +432,8 @@ function playOne(args: PlayArgs): GameRecord {
     extractionFailure: metrics.extractionFailures > 0,
     carrierRouted: metrics.ladenFlagBearerRoutings > 0,
     gateContainmentDiagnostics: gateDiagnostics,
+    repetitionDiagnostics,
+    selectedMoveDiagnostics,
     metrics,
   };
 }
@@ -391,7 +470,35 @@ function applyTrackedMove(state: GameState, move: Move, moves: Move[], labels: s
   if (/wins/.test(events)) metrics.homeVictories++;
   moves.push(move);
   labels.push(`${move.pieceId}:${fromCoord(from)}-${fromCoord(move.to)}`);
-  return { state: next, previousMove: { pieceId: move.pieceId, from, to: move.to } };
+  const meaningfulProgress = isMeaningfulProgressTransition(state, next, events);
+  return { state: next, previousMove: { pieceId: move.pieceId, from, to: move.to }, meaningfulProgress };
+}
+
+const MEANINGFUL_PROGRESS_EVENT_PATTERN = /Wall removed|entered the Sanctuary|took the flag|ran out of extraction turns|departed the gate|routed|captured|promoted|demoted|wins/;
+
+export function isMeaningfulProgressTransition(before: GameState, after: GameState, events = ""): boolean {
+  if (before.winner !== after.winner) return true;
+  if (before.extractionTurnsRemaining !== after.extractionTurnsRemaining) return true;
+  if (before.forcedGateDeparture !== after.forcedGateDeparture) return true;
+  if (before.walls.west !== after.walls.west || before.walls.east !== after.walls.east) return true;
+  if (JSON.stringify(before.flag) !== JSON.stringify(after.flag)) return true;
+  if (JSON.stringify(before.unladenSanctuary) !== JSON.stringify(after.unladenSanctuary)) return true;
+  if (before.engineersRemoved !== after.engineersRemoved) return true;
+  const beforePieces = new Map(before.pieces.map((p) => [p.id, p]));
+  if (before.pieces.length !== after.pieces.length) return true;
+  for (const piece of after.pieces) {
+    const old = beforePieces.get(piece.id);
+    if (!old || old.type !== piece.type || old.player !== piece.player) return true;
+    const routedLikeMoveToHome = old.col !== piece.col || old.row !== piece.row;
+    if (routedLikeMoveToHome && MEANINGFUL_PROGRESS_EVENT_PATTERN.test(events)) return true;
+  }
+  return MEANINGFUL_PROGRESS_EVENT_PATTERN.test(events);
+}
+
+function isRunnerImmediateReversal(previous: MoveRecord | null, move: Move, state: GameState): boolean {
+  if (!previous || previous.pieceId !== move.pieceId) return false;
+  const piece = state.pieces.find((p) => p.id === move.pieceId);
+  return !!piece && previous.from.col === move.to.col && previous.from.row === move.to.row && previous.to.col === piece.col && previous.to.row === piece.row;
 }
 
 function moveLabel(state: GameState, move: Move): string {
@@ -488,7 +595,7 @@ function finalize(games: GameRecord[], positions: Array<Record<string, unknown>>
     cancelled,
     allReplayVerified: summary.replayFailures === 0,
   };
-  const summaryRows = games.map((g) => ({ id: g.id, seed: g.seed, winner: g.winner ?? "draw", drawReason: g.drawReason, plies: g.plies, replayOk: g.replayOk, opening: g.opening, forcedGreenOpening: g.forcedGreenOpening, forcedBlueReply: g.forcedBlueReply, greenOpeningLabel: g.greenOpeningLabel, blueReplyLabel: g.blueReplyLabel, matchupId: g.matchupId, mirrorPairId: g.mirrorPairId, requestedSearchDepth: g.requestedSearchDepth, completedSearchDepth: g.completedSearchDepth, nodesSearched: g.nodesSearched, leafEvaluations: g.leafEvaluations, alphaBetaCutoffs: g.alphaBetaCutoffs, transpositionTableHits: g.transpositionTableHits, searchElapsedMs: g.searchElapsedMs, timedOut: g.timedOut, principalVariation: g.principalVariation, gateContainmentDiagnostics: JSON.stringify(g.gateContainmentDiagnostics), firstPickupPlayer: g.firstPickupPlayer, pickupPly: g.pickupPly, extractionFailure: g.extractionFailure, carrierRouted: g.carrierRouted }));
+  const summaryRows = games.map((g) => ({ id: g.id, seed: g.seed, winner: g.winner ?? "draw", drawReason: g.drawReason, plies: g.plies, replayOk: g.replayOk, opening: g.opening, forcedGreenOpening: g.forcedGreenOpening, forcedBlueReply: g.forcedBlueReply, greenOpeningLabel: g.greenOpeningLabel, blueReplyLabel: g.blueReplyLabel, matchupId: g.matchupId, mirrorPairId: g.mirrorPairId, requestedSearchDepth: g.requestedSearchDepth, completedSearchDepth: g.completedSearchDepth, nodesSearched: g.nodesSearched, leafEvaluations: g.leafEvaluations, alphaBetaCutoffs: g.alphaBetaCutoffs, transpositionTableHits: g.transpositionTableHits, searchElapsedMs: g.searchElapsedMs, timedOut: g.timedOut, principalVariation: g.principalVariation, gateContainmentDiagnostics: JSON.stringify(g.gateContainmentDiagnostics), repetitionDiagnostics: JSON.stringify(g.repetitionDiagnostics), selectedMoveDiagnostics: JSON.stringify(g.selectedMoveDiagnostics), uniquePositionsVisited: g.repetitionDiagnostics.uniquePositionsVisited, repeatedPositionsCount: g.repetitionDiagnostics.repeatedPositionsCount, maximumRepetitionCount: g.repetitionDiagnostics.maximumRepetitionCount, immediateReversals: g.repetitionDiagnostics.immediateReversals, twoPlyCycles: g.repetitionDiagnostics.twoPlyCycles, fourPlyCycles: g.repetitionDiagnostics.fourPlyCycles, noProgressPlies: g.repetitionDiagnostics.noProgressPlies, longestNoProgressStreak: g.repetitionDiagnostics.longestNoProgressStreak, repetitionDraw: g.repetitionDiagnostics.repetitionDraw, noProgressDraw: g.repetitionDiagnostics.noProgressDraw, firstRepeatingCyclePly: g.repetitionDiagnostics.firstRepeatingCyclePly, firstPickupPlayer: g.firstPickupPlayer, pickupPly: g.pickupPly, extractionFailure: g.extractionFailure, carrierRouted: g.carrierRouted }));
   const files: ExportFile[] = [
     { name: "games.jsonl", mime: "application/x-ndjson", content: jsonl(games) },
     { name: "positions.jsonl", mime: "application/x-ndjson", content: jsonl(positions) },

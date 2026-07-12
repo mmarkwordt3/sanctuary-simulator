@@ -12,6 +12,7 @@ export interface StandardSettings {
   blueDiversity: DiversityLevel;
   seed: number;
   maxPlies: number;
+  noProgressPlyLimit?: number;
   positionSampling: PositionSampling;
 }
 
@@ -25,6 +26,7 @@ export interface OpeningSettings {
   blueDiversity: DiversityLevel;
   seed: number;
   maxPlies: number;
+  noProgressPlyLimit?: number;
   positionSampling: PositionSampling;
 }
 
@@ -37,6 +39,7 @@ export interface TargetedOpeningSettings {
   blueDiversity: DiversityLevel;
   seed: number;
   maxPlies: number;
+  noProgressPlyLimit?: number;
   timeLimitMs: number;
   positionSampling: PositionSampling;
   selectedGreenOpenings: string[];
@@ -72,6 +75,7 @@ export const DEFAULT_SETTINGS: SimulatorUiSettings = {
     searchDepth: 2,
     seed: 12345,
     maxPlies: 500,
+    noProgressPlyLimit: 40,
     positionSampling: "none",
   },
   opening: {
@@ -84,6 +88,7 @@ export const DEFAULT_SETTINGS: SimulatorUiSettings = {
     searchDepth: 2,
     seed: 12345,
     maxPlies: 500,
+    noProgressPlyLimit: 40,
     positionSampling: "none",
   },
   targeted: {
@@ -95,6 +100,7 @@ export const DEFAULT_SETTINGS: SimulatorUiSettings = {
     searchDepth: 2,
     seed: 12345,
     maxPlies: 500,
+    noProgressPlyLimit: 40,
     timeLimitMs: 0,
     positionSampling: "none",
     selectedGreenOpenings: [],
