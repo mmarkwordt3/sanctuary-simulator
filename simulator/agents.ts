@@ -22,6 +22,7 @@ export interface AgentContext {
   seed: number;
   recentPositions?: ReadonlyMap<string, number>;
   previousMove?: MoveRecord | null;
+  currentNoProgressPlies?: number;
   searchDepth?: number;
   diversity?: DiversityLevel;
   timeLimitMs?: number;
@@ -49,6 +50,10 @@ export interface EvaluationBreakdown {
   carrierContainment: number;
   mobility: number;
   repetitionPenalty: number;
+  immediateReversalPenalty: number;
+  repeatedCyclePenalty: number;
+  stagnationPenalty: number;
+  objectiveProgress: number;
   total: number;
 }
 
@@ -117,8 +122,19 @@ export const EVALUATION_WEIGHTS = {
   routerNearCarrier: 170,
   carrierHomeApproach: 220,
   mobilityStep: 4,
+  repeatedPositionFirst: -180,
+  repeatedPositionSecond: -700,
+  threefoldDrawScore: 0,
   repeatedPosition: -650,
   immediateReversal: -450,
+  twoPlyCycle: -240,
+  fourPlyCycle: -520,
+  stagnationPerPly: -18,
+  ladenCarrierHomeStep: 120,
+  enemyCarrierHomeReduction: 100,
+  defenderRoutingPressure: 85,
+  carrierMobility: 20,
+  irreversibleProgress: 180,
 } as const;
 
 const SIDE_GATES = [toCoord(GATES.west), toCoord(GATES.east)];
@@ -282,7 +298,8 @@ export function positionKey(state: GameState): string {
     flag: state.flag,
     extractionTurnsRemaining: state.extractionTurnsRemaining,
     forcedGateDeparture: state.forcedGateDeparture,
-    winner: state.winner,
+    unladenSanctuary: state.unladenSanctuary,
+    engineersRemoved: state.engineersRemoved,
   });
 }
 
@@ -297,7 +314,7 @@ function isImmediateReversal(previous: MoveRecord | null | undefined, move: Move
 export function evaluateState(
   state: GameState,
   player: Player,
-  context: Pick<AgentContext, "recentPositions"> = {},
+  context: Pick<AgentContext, "recentPositions" | "currentNoProgressPlies"> = {},
 ): EvaluationBreakdown {
   const b: EvaluationBreakdown = {
     terminal: 0,
@@ -313,6 +330,10 @@ export function evaluateState(
     carrierContainment: 0,
     mobility: 0,
     repetitionPenalty: 0,
+    immediateReversalPenalty: 0,
+    repeatedCyclePenalty: 0,
+    stagnationPenalty: 0,
+    objectiveProgress: 0,
     total: 0,
   };
 
@@ -362,11 +383,14 @@ export function evaluateState(
         carrier.player,
         EVALUATION_WEIGHTS.postExtraction + (12 - d) * EVALUATION_WEIGHTS.homeDistance,
       );
+      b.objectiveProgress += signed(player, carrier.player, (12 - d) * EVALUATION_WEIGHTS.ladenCarrierHomeStep);
     }
 
     const friendlyNear = state.pieces.filter((p) => p.player === carrier.player && p.id !== carrier.id && chebyshev(p, carrier) <= 2).length;
     const enemyNear = state.pieces.filter((p) => p.player !== carrier.player && chebyshev(p, carrier) <= 2).length;
     b.carrierSafety += signed(player, carrier.player, (friendlyNear - enemyNear) * EVALUATION_WEIGHTS.carrierProtection);
+    b.objectiveProgress += signed(player, carrier.player, Math.max(0, 4 - enemyNear) * EVALUATION_WEIGHTS.carrierMobility);
+    b.objectiveProgress += signed(player, carrier.player === "green" ? "blue" : "green", enemyNear * EVALUATION_WEIGHTS.defenderRoutingPressure);
   } else if (opened.length > 0) {
     for (const bearer of state.pieces.filter((p) => p.type === "flagBearer")) {
       const entranceDistance = minDistance(bearer, SANCTUARY_ENTRANCES.filter((g) => opened.some((o) => o.col === g.col && o.row === g.row) || g.col === 6));
@@ -389,7 +413,8 @@ export function evaluateState(
   b.mobility = signed(player, state.current, currentMobility * EVALUATION_WEIGHTS.mobilityStep);
 
   const repeats = context.recentPositions?.get(positionKey(state)) ?? 0;
-  b.repetitionPenalty = repeats * EVALUATION_WEIGHTS.repeatedPosition;
+  b.repetitionPenalty = repeats >= 2 ? EVALUATION_WEIGHTS.repeatedPositionSecond : repeats === 1 ? EVALUATION_WEIGHTS.repeatedPositionFirst : 0;
+  b.stagnationPenalty = Math.max(0, context.currentNoProgressPlies ?? 0) * EVALUATION_WEIGHTS.stagnationPerPly;
 
   b.total = Object.entries(b).filter(([k]) => k !== "total").reduce((sum, [, value]) => sum + value, 0);
   const cap = EVALUATION_WEIGHTS.terminalWin - 1;
@@ -453,7 +478,8 @@ function evaluateMove(
     : breakdown.total;
   if (isImmediateReversal(context.previousMove, move, state)) score += EVALUATION_WEIGHTS.immediateReversal;
   const repeatCount = context.recentPositions?.get(positionKey(next)) ?? 0;
-  if (repeatCount) score += repeatCount * EVALUATION_WEIGHTS.repeatedPosition;
+  if (repeatCount >= 2) score = EVALUATION_WEIGHTS.threefoldDrawScore;
+  else if (repeatCount === 1) score += EVALUATION_WEIGHTS.repeatedPositionSecond;
   return { move, score, breakdown, principalVariation, tie: moveTieKey(state, move, context.seed) };
 }
 
@@ -561,7 +587,9 @@ function searchValueAfterMove(
 ): number {
   if (depth === 0 || state.winner) return evaluateState(state, rootPlayer, context).total;
   const key = positionKey(state);
-  if (path.includes(key)) return evaluateState(state, rootPlayer, context).total + EVALUATION_WEIGHTS.repeatedPosition * 2;
+  const pathRepeats = path.filter((k) => k === key).length;
+  if (pathRepeats >= 2) return EVALUATION_WEIGHTS.threefoldDrawScore;
+  if (pathRepeats > 0) return evaluateState(state, rootPlayer, context).total + EVALUATION_WEIGHTS.repeatedPositionSecond;
   const moves = staticRankedMoves(state, allLegalMoves(state), state.current, context, 12);
   if (!moves.length) return evaluateState(state, rootPlayer, context).total;
   const opponent = state.current !== rootPlayer;
@@ -613,14 +641,18 @@ function alphaBetaValue(state: GameState, depth: number, root: Player, context: 
   if (checkTimeout(ab)) return null;
   ab.diagnostics.nodesSearched++;
   const pkey = positionKey(state);
-  if (depth === 0 || state.winner || path.includes(pkey)) {
+  const pathRepeats = path.filter((k) => k === pkey).length;
+  if (depth === 0 || state.winner || pathRepeats > 0) {
     ab.diagnostics.leafEvaluations++;
-    const repeat = path.includes(pkey) ? EVALUATION_WEIGHTS.repeatedPosition * 2 : 0;
+    const repeat = pathRepeats >= 2 ? EVALUATION_WEIGHTS.threefoldDrawScore - evaluateState(state, root, context).total : pathRepeats ? EVALUATION_WEIGHTS.repeatedPositionSecond : 0;
     return { score: evaluateState(state, root, context).total + repeat, pv: [] };
   }
   const originalAlpha = alpha, originalBeta = beta;
   const key = ttKey(state, depth, root);
-  const cached = ab.table.get(key);
+  // Repetition-sensitive nodes are not stored or reused across unrelated histories;
+  // the TT key remains compact for safe non-repeating nodes.
+  const historySensitive = path.some((k) => k === pkey) || (context.recentPositions?.has(pkey) ?? false);
+  const cached = historySensitive ? undefined : ab.table.get(key);
   if (cached && cached.searchedDepth >= depth) {
     ab.diagnostics.transpositionTableHits++;
     if (cached.bound === "exact") return { score: cached.score, pv: cached.pv };
@@ -646,7 +678,7 @@ function alphaBetaValue(state: GameState, depth: number, root: Player, context: 
     if (alpha >= beta) { ab.diagnostics.alphaBetaCutoffs++; break; }
   }
   const bound: BoundType = best <= originalAlpha ? "upper" : best >= originalBeta ? "lower" : "exact";
-  ab.table.set(key, { score: best, searchedDepth: depth, bound, bestMove, pv: bestPv });
+  if (!historySensitive) ab.table.set(key, { score: best, searchedDepth: depth, bound, bestMove, pv: bestPv });
   return { score: best, pv: bestPv };
 }
 
@@ -761,6 +793,7 @@ export interface SearchBenchmarkResult {
   selectedMove: Move | null;
   score: number | null;
   nodesSearched: number;
+  leafEvaluations: number;
   elapsedMs: number;
   alphaBetaCutoffs: number;
   transpositionTableHits: number;
@@ -772,7 +805,9 @@ function countedFullSearchValue(state: GameState, depth: number, rootPlayer: Pla
   counts.nodes++;
   if (depth === 0 || state.winner) { counts.leaves++; return evaluateState(state, rootPlayer, context).total; }
   const key = positionKey(state);
-  if (path.includes(key)) { counts.leaves++; return evaluateState(state, rootPlayer, context).total + EVALUATION_WEIGHTS.repeatedPosition * 2; }
+  const pathRepeats = path.filter((k) => k === key).length;
+  if (pathRepeats >= 2) { counts.leaves++; return EVALUATION_WEIGHTS.threefoldDrawScore; }
+  if (pathRepeats > 0) { counts.leaves++; return evaluateState(state, rootPlayer, context).total + EVALUATION_WEIGHTS.repeatedPositionSecond; }
   const moves = staticRankedMoves(state, allLegalMoves(state), state.current, context, 12);
   if (!moves.length) { counts.leaves++; return evaluateState(state, rootPlayer, context).total; }
   const opponent = state.current !== rootPlayer;
@@ -807,7 +842,7 @@ function benchmarkAlphaBetaFixedDepth(state: GameState, context: AgentContext): 
   }
   scored.sort((a,b) => b.score-a.score || a.tie.localeCompare(b.tie));
   const chosen = chooseScoredMove(state, scored, context, false, legal.length);
-  return { selectedMove: chosen.move, score: chosen.selectedScore, nodesSearched: diagnostics.nodesSearched, elapsedMs: Number((performance.now() - started).toFixed(3)), alphaBetaCutoffs: diagnostics.alphaBetaCutoffs, transpositionTableHits: diagnostics.transpositionTableHits, completedDepth: depth, principalVariation: chosen.principalVariation };
+  return { selectedMove: chosen.move, score: chosen.selectedScore, nodesSearched: diagnostics.nodesSearched, leafEvaluations: diagnostics.leafEvaluations, elapsedMs: Number((performance.now() - started).toFixed(3)), alphaBetaCutoffs: diagnostics.alphaBetaCutoffs, transpositionTableHits: diagnostics.transpositionTableHits, completedDepth: depth, principalVariation: chosen.principalVariation };
 }
 
 export function benchmarkSearchSelection(state: GameState, agent: "search-deterministic" | "search-alpha-beta-deterministic", context: AgentContext): SearchBenchmarkResult {
@@ -825,10 +860,10 @@ export function benchmarkSearchSelection(state: GameState, agent: "search-determ
     return { move, score, breakdown, principalVariation: pv, tie: moveTieKey(state, move, context.seed) } satisfies ScoredMove;
   }).filter((m): m is ScoredMove => m !== null).sort((a,b) => b.score-a.score || a.tie.localeCompare(b.tie));
   const chosen = chooseScoredMove(state, scored, context, false, allLegalMoves(state).length);
-  return { selectedMove: chosen.move, score: chosen.selectedScore, nodesSearched: counts.nodes, elapsedMs: Number((performance.now() - started).toFixed(3)), alphaBetaCutoffs: 0, transpositionTableHits: 0, completedDepth: context.searchDepth ?? 2, principalVariation: chosen.principalVariation };
+  return { selectedMove: chosen.move, score: chosen.selectedScore, nodesSearched: counts.nodes, leafEvaluations: counts.leaves, elapsedMs: Number((performance.now() - started).toFixed(3)), alphaBetaCutoffs: 0, transpositionTableHits: 0, completedDepth: context.searchDepth ?? 2, principalVariation: chosen.principalVariation };
 }
 
-export function diagnosticBreakdown(state: GameState, player: Player, context?: Pick<AgentContext, "recentPositions">): EvaluationBreakdown {
+export function diagnosticBreakdown(state: GameState, player: Player, context?: Pick<AgentContext, "recentPositions" | "currentNoProgressPlies">): EvaluationBreakdown {
   return evaluateState(state, player, context);
 }
 
