@@ -97,3 +97,43 @@ describe("Phase 3 evolutionary tuning", () => {
     expect(promoted.profileId).not.toBe(baseline.profileId);
   });
 });
+describe("promotion recommendation evidence thresholds", () => {
+  function phaseRows(profileId: string, validation: Array<"win"|"loss"|"draw">, holdout: Array<"win"|"loss"|"draw">): TuningMatch[] {
+    const toResult = (outcome: "win"|"loss"|"draw") => outcome === "win" ? "green" : outcome === "loss" ? "blue" : "draw";
+    return [
+      ...validation.map((outcome, i) => match(profileId, toResult(outcome), { matchId: `v-${i}`, fixture: "validation" })),
+      ...holdout.map((outcome, i) => match(profileId, toResult(outcome), { matchId: `h-${i}`, fixture: "holdout" })),
+    ];
+  }
+  function promotable(profileId = "p") { return { ...candidate("c", profileId), score: 12, baselineScore: 1, mirrorPenalty: 0, instabilityPenalty: 0 }; }
+
+  it("allows manual promotion only with positive validation and positive holdout", () => {
+    const report = promotionEligibility(promotable(), phaseRows("p", ["win"], ["win"]));
+    expect(report.recommendation).toBe("eligible for manual promotion");
+    expect(report.summary.validationEvidence).toBe("positive");
+    expect(report.summary.holdoutEvidence).toBe("positive");
+  });
+
+  it("continues testing for neutral validation and neutral holdout", () => {
+    const report = promotionEligibility(promotable(), phaseRows("p", ["draw"], ["draw"]));
+    expect(report.recommendation).toBe("continue testing");
+    expect(report.summary.reason).toMatch(/Validation evidence is not positive/);
+  });
+
+  it("continues testing for positive validation but neutral holdout", () => {
+    const report = promotionEligibility(promotable(), phaseRows("p", ["win"], ["draw"]));
+    expect(report.recommendation).toBe("continue testing");
+    expect(report.summary.reason).toMatch(/Holdout evidence is not positive/);
+  });
+
+  it("blocks negative validation or negative holdout", () => {
+    expect(promotionEligibility(promotable(), phaseRows("p", ["loss"], ["win"])).recommendation).not.toBe("eligible for manual promotion");
+    expect(promotionEligibility(promotable(), phaseRows("p", ["win"], ["loss"])).recommendation).not.toBe("eligible for manual promotion");
+  });
+
+  it("blocks baseline regression and unresolved validation or holdout", () => {
+    expect(promotionEligibility({ ...promotable(), baselineScore: -1 }, phaseRows("p", ["win"], ["win"])).recommendation).not.toBe("eligible for manual promotion");
+    expect(promotionEligibility(promotable(), phaseRows("p", [], ["win"])).recommendation).not.toBe("eligible for manual promotion");
+    expect(promotionEligibility(promotable(), phaseRows("p", ["win"], [])).recommendation).not.toBe("eligible for manual promotion");
+  });
+});

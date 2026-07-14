@@ -1,7 +1,8 @@
 import { buildTargetedJobs, replayStoredGameTimeline, targetedForcedPairingCount, targetedOpeningOptions, suspectedBlueFlagBearerPreset, validateTargetedSettings } from "./simulation-runner.ts";
 import { AGENT_CHOICES, DEFAULT_SETTINGS, agentUsesDiversity, agentUsesSearchDepth, type SimulatorUiSettings } from "./config.ts";
 import type { AgentName } from "../../simulator/agents.ts";
-import { makeZip, type ExportFile } from "./exporters.ts";
+import { type ExportFile } from "./exporters.ts";
+import { triggerDownloadFile, triggerDownloadZip } from "./downloads.ts";
 import { ExperimentStore, estimateExperiment, exportExperiment, replayStoredGame, type CompletedGameRecord, type ExperimentSettings, type GameQuery, type GameJobRecord } from "./experiments.ts";
 import { compareExperiments, type AnalysisFlag, type ExperimentAnalysis, type FollowUpProposal } from "./analysis.ts";
 import type { ExperimentWorkerResponse } from "./experiment-worker.ts";
@@ -189,11 +190,11 @@ function renderDownloads(files: ExportFile[]): void {
   const zip = { name: "sanctuary-simulator-results.zip", mime: "application/zip", content: "" };
   document.querySelector("#downloads")!.innerHTML = files.map((f, i) => `<button data-file="${i}">${f.name}</button>`).join("") + `<button data-zip="1">ZIP containing all results</button>`;
   document.querySelectorAll<HTMLButtonElement>("[data-file]").forEach((button) => button.addEventListener("click", () => download(files[Number(button.dataset.file)])));
-  document.querySelector<HTMLButtonElement>("[data-zip]")!.addEventListener("click", () => downloadBlob(zip.name, makeZip(files)));
+  document.querySelector<HTMLButtonElement>("[data-zip]")!.addEventListener("click", () => { try { setDownloadFeedback(`Downloaded ${triggerDownloadZip(zip.name, files).filename}.`); } catch (err) { setDownloadFeedback(err instanceof Error ? err.message : String(err), true); } });
 }
 
-function download(file: ExportFile): void { downloadBlob(file.name, new Blob([file.content], { type: file.mime })); }
-function downloadBlob(name: string, blob: Blob): void { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click(); URL.revokeObjectURL(a.href); }
+function download(file: ExportFile): void { setDownloadFeedback(`Downloaded ${triggerDownloadFile(file).filename}.`); }
+function setDownloadFeedback(message: string, error = false): void { const el = document.querySelector("#downloads"); if (el) el.insertAdjacentHTML("afterbegin", `<p class="${error ? "warning" : "success"}">${message}</p>`); const tuning = document.querySelector("#tune-profile-info"); if (tuning) tuning.textContent = message; }
 function input(label: string, id: string, value: number, type: string, title: string): string { return `<label title="${title}">${label}<input id="${id}" type="${type}" value="${value}"></label>`; }
 function checkbox(label: string, id: string, value: boolean): string { return `<label>${label}<input id="${id}" type="checkbox" ${value ? "checked" : ""}></label>`; }
 function selectAgent(label: string, id: string, value: AgentName): string { return select(label, id, value, AGENT_CHOICES); }
@@ -254,7 +255,7 @@ async function experimentAction(event: Event): Promise<void> {
     }
     await experimentStore.cancelExperiment(experimentId);
   }
-  if (action === "export") return downloadBlob(`${experimentId}.zip`, makeZip(await exportExperiment(experimentStore, experimentId)));
+  if (action === "export") { try { setDownloadFeedback(`Downloaded ${triggerDownloadZip(`${experimentId}.zip`, await exportExperiment(experimentStore, experimentId)).filename}.`); } catch (err) { setDownloadFeedback(err instanceof Error ? err.message : String(err), true); } return; }
   if (action === "retry") await experimentStore.retryFailedJobs(experimentId);
   if (action === "delete" && confirm("Delete this experiment, jobs, and games?")) await experimentStore.deleteExperiment(experimentId);
   await renderExperiments();
@@ -471,10 +472,25 @@ async function tuningAction(event: Event): Promise<void> {
   if (action === "cancel") await tuningStore.cancelTuningRun(id);
   if (action === "retry") await tuningStore.retryFailedMatches(id);
   if (action === "delete") await tuningStore.deleteTuningRun(id);
-  if (action === "export") { const files = await tuningStore.exportTuningRun(id); renderDownloads(files); }
-  if (action === "approve") await tuningStore.approveCandidate(id, button.dataset.candidate!);
-  if (action === "reject") await tuningStore.rejectCandidate(id, button.dataset.candidate!);
-  if (action === "confirm") alert("Create confirmation experiment is available as an explicit manual next step; production defaults are unchanged.");
-  if (action === "report") { const files = (await tuningStore.exportTuningRun(id)).filter(f => f.name.startsWith("promotion_report")); renderDownloads(files); }
+  try {
+    if (action === "export") {
+      const snap = await tuningStore.loadTuningRun(id);
+      if (!snap) throw new Error("Tuning run not found; nothing was exported.");
+      if (!snap.matches.length || !snap.candidates.length || !snap.profiles.length) throw new Error("Tuning run is not exportable yet because persisted profiles, candidates, or matches are missing.");
+      const files = await tuningStore.exportTuningRun(id);
+      const result = triggerDownloadZip(`${id}-tuning-export.zip`, files);
+      setDownloadFeedback(`Downloaded ${result.filename} (${result.bytes} bytes).`);
+    }
+    if (action === "approve") await tuningStore.approveCandidate(id, button.dataset.candidate!);
+    if (action === "reject") await tuningStore.rejectCandidate(id, button.dataset.candidate!);
+    if (action === "confirm") alert("Create confirmation experiment is available as an explicit manual next step; production defaults are unchanged.");
+    if (action === "report") {
+      const snap = await tuningStore.loadTuningRun(id);
+      if (!snap?.reports.length) throw new Error("No promotion report exists yet. Complete validation and holdout before exporting the report.");
+      const files = (await tuningStore.exportTuningRun(id)).filter(f => f.name === "promotion_report.md" || f.name === "promotion_report.json");
+      const result = triggerDownloadZip(`${id}-promotion-report.zip`, files);
+      setDownloadFeedback(`Downloaded ${result.filename} (${result.bytes} bytes).`);
+    }
+  } catch (err) { setDownloadFeedback(err instanceof Error ? err.message : String(err), true); }
   await renderTuningRuns();
 }

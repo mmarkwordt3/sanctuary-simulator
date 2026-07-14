@@ -56,12 +56,18 @@ describe("persistent evolutionary tuning lifecycle", () => {
     expect(final.matches.filter(m => m.fixture === "holdout").length).toBeGreaterThan(0);
     expect(final.run.status).toBe("completed");
     expect(final.reports.length).toBeGreaterThan(0);
+    const files = await store.exportTuningRun(run.tuningRunId);
+    expect(files.find(f => f.name === "matches.csv")!.content).toContain("tuningRunId");
+    expect(files.find(f => f.name === "evaluation_profiles.json")!.content).toContain("profileId");
+    expect(files.find(f => f.name === "promotion_report.md")!.content.length).toBeGreaterThan(20);
+    expect(final.candidates.some(c => c.scoreBreakdown?.validationScore !== undefined && c.scoreBreakdown?.holdoutScore !== undefined)).toBe(true);
   }, 30000);
 
   it("pauses, retries failures, cancels while preserving completions, deletes linked records, and preserves approved profiles", async () => {
     const store = new TuningStore(dbName());
     const run = await store.createTuningRun(quickSettings());
-    const first = (await store.nextQueuedMatch(run.tuningRunId))!;
+    expect((await store.loadTuningRun(run.tuningRunId))!.reports).toHaveLength(0);
+    const first = (await store.nextQueuedMatch(run.tuningRunId))!
     await store.markMatchRunning(run.tuningRunId, first.matchId);
     await store.completeMatch(run.tuningRunId, first.matchId, { result: "draw", plies: 10, drawReason: "max-plies", diagnostics: { illegalMoves: 0 }, replayOk: true });
     const second = (await store.nextQueuedMatch(run.tuningRunId))!;

@@ -261,8 +261,17 @@ export class TuningStore {
       if (!scheduledFinals && match.fixture === "holdout") {
         const holdoutDone = matches.filter((m) => m.fixture === "holdout").every((m) => ["completed", "failed", "cancelled"].includes(m.status));
         if (holdoutDone) {
-          const scoredFinalists = scoreCandidates(candidates, matches.filter((m) => m.fixture !== "holdout"));
-          const best = scoredFinalists[0] ?? [...candidates].sort((a, b) => b.score - a.score || a.candidateId.localeCompare(b.candidateId))[0];
+          const finalGeneration = Math.max(...candidates.map((c) => c.generation));
+          const finalCandidates = candidates.filter((c) => c.generation === finalGeneration);
+          const scoredFinalists = scoreCandidates(finalCandidates, matches.filter((m) => m.fixture !== "holdout"));
+          const withFinalPhaseScores = scoredFinalists.map((candidate) => {
+            const related = matches.filter((m) => m.greenProfileId === candidate.profileId || m.blueProfileId === candidate.profileId);
+            const phaseScore = (fixture: "validation" | "holdout") => related.filter((m) => m.fixture === fixture).reduce((sum, m) => sum + (m.result === "draw" ? 0 : (m.greenProfileId === candidate.profileId && m.result === "green") || (m.blueProfileId === candidate.profileId && m.result === "blue") ? 1 : -1), 0);
+            return { ...candidate, scoreBreakdown: { ...(candidate.scoreBreakdown ?? {}), validationScore: phaseScore("validation"), holdoutScore: phaseScore("holdout") } };
+          });
+          for (const c of withFinalPhaseScores) tx.objectStore("tuningCandidates").put(c);
+          candidates = candidates.map((c) => withFinalPhaseScores.find((s) => s.candidateId === c.candidateId) ?? c);
+          const best = withFinalPhaseScores[0] ?? finalCandidates.sort((a, b) => b.score - a.score || a.candidateId.localeCompare(b.candidateId))[0];
           if (best) { const report = promotionEligibility(best, matches); tx.objectStore("promotionReports").put(report); run.bestCandidateId = best.candidateId; }
           run.status = "completed"; run.currentPhase = "complete"; run.completedAt = completedAt;
         }
