@@ -14,6 +14,7 @@ import {
 import { canonicalLabel } from "../../simulator/mirror.ts";
 import { DEFAULT_SETTINGS, type BlueResponseMode, type OpeningSettings, type PositionSampling, type StandardSettings, type TargetedOpeningSettings } from "./config.ts";
 import { jsonl, markdownSummary, toCsv, type ExportFile } from "./exporters.ts";
+import type { EvaluationProfile } from "../../simulator/evaluation-profiles.ts";
 
 export interface RunnerControl {
   isCancelled(): boolean;
@@ -310,6 +311,8 @@ interface PlayArgs {
   blueResponseMode?: BlueResponseMode;
   matchupId?: string;
   mirrorPairId?: string;
+  greenEvaluationProfile?: EvaluationProfile;
+  blueEvaluationProfile?: EvaluationProfile;
 }
 
 export function runForcedLineForRepetitionTest(forcedPrefix: Move[], maxPlies = 100, noProgressPlyLimit = 40): GameRecord {
@@ -412,6 +415,7 @@ export function playExperimentGame(args: PlayArgs): GameRecord {
       diversity,
       timeLimitMs: args.timeLimitMs,
       currentNoProgressPlies: noProgressPlies,
+      evaluationProfile: state.current === "green" ? args.greenEvaluationProfile : args.blueEvaluationProfile,
     });
     if (!selection.move) break;
     if (selection.diagnostics) {
