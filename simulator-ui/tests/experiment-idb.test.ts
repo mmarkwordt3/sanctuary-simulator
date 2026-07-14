@@ -67,7 +67,9 @@ describe("IndexedDB experiment persistence", () => {
     await store.pauseRecovery();
     expect((await store.completedGames(exp.experimentId)).total).toBe(2);
     expect((await store.getJobs(exp.experimentId)).find((j) => j.jobId === jobs[2].jobId)!.status).toBe("queued");
-    for (const job of (await store.getJobs(exp.experimentId)).filter((j) => j.status === "queued")) {
+    while ((await store.getExperiment(exp.experimentId))!.completedJobs < (await store.getExperiment(exp.experimentId))!.totalJobs) {
+      const job = (await store.getJobs(exp.experimentId)).find((j) => j.status === "queued");
+      if (!job) break;
       await store.markJobRunning(exp.experimentId, job.jobId);
       const running = (await store.getJobs(exp.experimentId)).find((j) => j.jobId === job.jobId)!;
       await store.completeJob(exp.experimentId, running, runJobGame((await store.getExperiment(exp.experimentId))!, running));
@@ -80,7 +82,7 @@ describe("IndexedDB experiment persistence", () => {
     expect(completed.games.every((g) => replayStoredGame(g).ok)).toBe(true);
     expect((await exportExperiment(store, exp.experimentId)).map((f) => f.name)).toContain("games.jsonl");
     console.log(`acceptance: created=4 afterReload=2 final=${final.completedJobs}/${final.totalJobs} unique=${new Set(completed.games.map((g) => g.gameId)).size} replayOk=${completed.games.every((g) => replayStoredGame(g).ok)} exportFiles=${(await exportExperiment(store, exp.experimentId)).length}`);
-  });
+  }, 20000);
 
   it("cancels with completed games preserved, retries failed jobs, filters, paginates, and deletes", async () => {
     const store = new ExperimentStore(dbName());
@@ -98,5 +100,31 @@ describe("IndexedDB experiment persistence", () => {
     expect(await store.getExperiment(exp.experimentId)).toBeUndefined();
     expect(await store.getJobs(exp.experimentId)).toHaveLength(0);
     expect((await store.completedGames(exp.experimentId)).total).toBe(0);
-  });
+  }, 20000);
+});
+
+describe("active runtime accounting", () => {
+  it("counts completed and failed active durations without counting paused time, and exports JSON prefixes", async () => {
+    const store = new ExperimentStore(dbName());
+    const exp = await store.createExperiment("Runtime", acceptanceSettings());
+    const [first, second] = await store.getJobs(exp.experimentId);
+    await store.markJobRunning(exp.experimentId, first.jobId);
+    await new Promise((r) => setTimeout(r, 5));
+    await store.pauseExperiment(exp.experimentId);
+    const afterPause = (await store.getExperiment(exp.experimentId))!.activeMs;
+    await new Promise((r) => setTimeout(r, 20));
+    expect((await store.getExperiment(exp.experimentId))!.activeMs).toBe(afterPause);
+    await store.markJobRunning(exp.experimentId, first.jobId);
+    await new Promise((r) => setTimeout(r, 5));
+    await store.completeJob(exp.experimentId, (await store.getJobs(exp.experimentId)).find((j) => j.jobId === first.jobId)!, runJobGame((await store.getExperiment(exp.experimentId))!, first));
+    const afterComplete = (await store.getExperiment(exp.experimentId))!.activeMs;
+    expect(afterComplete).toBeGreaterThan(0);
+    await store.markJobRunning(exp.experimentId, second.jobId);
+    await new Promise((r) => setTimeout(r, 5));
+    await store.failJob(exp.experimentId, (await store.getJobs(exp.experimentId)).find((j) => j.jobId === second.jobId)!, "expected failure");
+    expect((await store.getExperiment(exp.experimentId))!.activeMs).toBeGreaterThan(afterComplete);
+    const jobsCsv = (await exportExperiment(store, exp.experimentId)).find((f) => f.name === "game_jobs.csv")!.content;
+    expect(jobsCsv).not.toContain("[object Object]");
+    expect(jobsCsv).toContain('"[{""pieceId"');
+  }, 20000);
 });
