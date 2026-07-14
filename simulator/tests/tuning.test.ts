@@ -97,7 +97,6 @@ describe("Phase 3 evolutionary tuning", () => {
     expect(promoted.profileId).not.toBe(baseline.profileId);
   });
 });
-
 describe("promotion recommendation evidence thresholds", () => {
   function phaseRows(profileId: string, validation: Array<"win"|"loss"|"draw">, holdout: Array<"win"|"loss"|"draw">): TuningMatch[] {
     const toResult = (outcome: "win"|"loss"|"draw") => outcome === "win" ? "green" : outcome === "loss" ? "blue" : "draw";
