@@ -12,7 +12,7 @@ import {
   gateContainmentDiagnostic,
 } from "../../simulator/agents.ts";
 import { canonicalLabel } from "../../simulator/mirror.ts";
-import { DEFAULT_SETTINGS, type OpeningSettings, type PositionSampling, type StandardSettings, type TargetedOpeningSettings } from "./config.ts";
+import { DEFAULT_SETTINGS, type BlueResponseMode, type OpeningSettings, type PositionSampling, type StandardSettings, type TargetedOpeningSettings } from "./config.ts";
 import { jsonl, markdownSummary, toCsv, type ExportFile } from "./exporters.ts";
 
 export interface RunnerControl {
@@ -44,9 +44,11 @@ export interface GameRecord {
   first10: string;
   opening?: string;
   forcedGreenOpening?: string;
-  forcedBlueReply?: string;
+  forcedBlueReply?: string | null;
+  blueResponseMode?: BlueResponseMode;
+  actualBlueFirstMove?: string | null;
   greenOpeningLabel?: string;
-  blueReplyLabel?: string;
+  blueReplyLabel?: string | null;
   matchupId?: string;
   mirrorPairId?: string;
   requestedSearchDepth?: number;
@@ -155,25 +157,66 @@ export function suspectedBlueFlagBearerPreset(): TargetedOpeningSettings {
   for (const opening of options) {
     selectedBlueRepliesByOpening[opening.label] = opening.replies.filter((r) => /Flag Bearer:G13-(E11|I11)|blue.*flagBearer/i.test(r.label)).filter((r) => /G13-(E11|I11)/.test(r.label)).map((r) => r.label);
   }
-  return { ...DEFAULT_SETTINGS.targeted, selectedGreenOpenings: options.map((o) => o.label), selectedBlueRepliesByOpening };
+  return { ...DEFAULT_SETTINGS.targeted, blueResponseMode: "forced", selectedGreenOpenings: options.map((o) => o.label), selectedBlueRepliesByOpening };
 }
 
-export function buildTargetedJobs(settings: TargetedOpeningSettings) {
+export interface TargetedJob { opening: string; blueReply?: string; prefix: Move[]; matchupId: string; mirrorPairId: string; blueResponseMode: BlueResponseMode }
+
+export function normalizeTargetedSettings(settings: TargetedOpeningSettings | (Omit<TargetedOpeningSettings, "blueResponseMode"> & { blueResponseMode?: BlueResponseMode })): TargetedOpeningSettings {
+  const selectedBlueRepliesByOpening = settings.selectedBlueRepliesByOpening ?? {};
+  const hasForcedReplies = Object.values(selectedBlueRepliesByOpening).some((replies) => replies.length > 0);
+  return { ...settings, selectedBlueRepliesByOpening, blueResponseMode: settings.blueResponseMode ?? (hasForcedReplies ? "forced" : "automatic") };
+}
+
+export function targetedForcedPairingCount(settings: TargetedOpeningSettings): number {
+  const normalized = normalizeTargetedSettings(settings);
+  const selectedOpenings = new Set(normalized.selectedGreenOpenings);
+  return targetedOpeningOptions()
+    .filter((opening) => selectedOpenings.has(opening.label))
+    .reduce((sum, opening) => sum + opening.replies.filter((reply) => (normalized.selectedBlueRepliesByOpening[opening.label] ?? []).includes(reply.label)).length, 0);
+}
+
+export function validateTargetedSettings(settings: TargetedOpeningSettings): string[] {
+  const normalized = normalizeTargetedSettings(settings);
+  const errors: string[] = [];
+  if (normalized.selectedGreenOpenings.length === 0) errors.push("Select at least one Green opening.");
+  if (normalized.blueResponseMode === "forced") {
+    const options = new Map(targetedOpeningOptions().map((opening) => [opening.label, opening]));
+    for (const label of normalized.selectedGreenOpenings) {
+      const opening = options.get(label);
+      const selectedLegalReplies = opening?.replies.filter((reply) => (normalized.selectedBlueRepliesByOpening[label] ?? []).includes(reply.label)) ?? [];
+      if (selectedLegalReplies.length === 0) errors.push(`Select at least one Blue reply for ${label}.`);
+    }
+  }
+  if (buildTargetedJobs(normalized).length === 0) errors.push("Targeted Opening Test would create zero jobs.");
+  return [...new Set(errors)];
+}
+
+export function buildTargetedJobs(settings: TargetedOpeningSettings): TargetedJob[] {
+  const normalized = normalizeTargetedSettings(settings);
   const options = targetedOpeningOptions();
-  const jobs: Array<{ opening: string; blueReply: string; prefix: Move[]; matchupId: string; mirrorPairId: string }> = [];
+  const selectedOpenings = new Set(normalized.selectedGreenOpenings);
+  const jobs: TargetedJob[] = [];
   for (const opening of options) {
-    if (settings.selectedGreenOpenings.length && !settings.selectedGreenOpenings.includes(opening.label)) continue;
-    const selected = settings.selectedBlueRepliesByOpening[opening.label] ?? [];
+    if (!selectedOpenings.has(opening.label)) continue;
+    if (normalized.blueResponseMode === "automatic") {
+      jobs.push({ opening: opening.label, prefix: [opening.move], matchupId: `${opening.label}|automatic`, mirrorPairId: `${canonicalLabel(opening.label)}|automatic`, blueResponseMode: "automatic" });
+      continue;
+    }
+    const selected = normalized.selectedBlueRepliesByOpening[opening.label] ?? [];
     for (const reply of opening.replies) {
       if (!selected.includes(reply.label)) continue;
       const matchupId = `${opening.label}|${reply.label}`;
-      jobs.push({ opening: opening.label, blueReply: reply.label, prefix: [opening.move, reply.move], matchupId, mirrorPairId: `${canonicalLabel(opening.label)}|${canonicalLabel(reply.label)}` });
+      jobs.push({ opening: opening.label, blueReply: reply.label, prefix: [opening.move, reply.move], matchupId, mirrorPairId: `${canonicalLabel(opening.label)}|${canonicalLabel(reply.label)}`, blueResponseMode: "forced" });
     }
   }
   return jobs;
 }
 
 export async function runTargetedOpening(settings: TargetedOpeningSettings, control: RunnerControl): Promise<RunResult> {
+  settings = normalizeTargetedSettings(settings);
+  const validationErrors = validateTargetedSettings(settings);
+  if (validationErrors.length) throw new Error(validationErrors.join(" "));
   const jobs = buildTargetedJobs(settings);
   const totalGames = jobs.length * settings.gamesPerMatchup;
   const games: GameRecord[] = [];
@@ -183,7 +226,7 @@ export async function runTargetedOpening(settings: TargetedOpeningSettings, cont
     for (const job of jobGroup) for (let i = 0; i < settings.gamesPerMatchup; i++) {
       await control.waitIfPaused();
       if (control.isCancelled()) break;
-      games.push(playOne({ id: id++, seed: settings.seed + games.length, greenAgent: settings.greenAgent, blueAgent: settings.blueAgent, greenDiversity: settings.greenDiversity, blueDiversity: settings.blueDiversity, searchDepth: settings.searchDepth, timeLimitMs: settings.timeLimitMs, maxPlies: settings.maxPlies, noProgressPlyLimit: settings.noProgressPlyLimit ?? 40, positionSampling: settings.positionSampling, positions, forcedPrefix: job.prefix, opening: job.opening, forcedGreenOpening: job.opening, forcedBlueReply: job.blueReply, matchupId: job.matchupId, mirrorPairId: job.mirrorPairId }));
+      games.push(playOne({ id: id++, seed: settings.seed + games.length, greenAgent: settings.greenAgent, blueAgent: settings.blueAgent, greenDiversity: settings.greenDiversity, blueDiversity: settings.blueDiversity, searchDepth: settings.searchDepth, timeLimitMs: settings.timeLimitMs, maxPlies: settings.maxPlies, noProgressPlyLimit: settings.noProgressPlyLimit ?? 40, positionSampling: settings.positionSampling, positions, forcedPrefix: job.prefix, opening: job.opening, forcedGreenOpening: job.opening, forcedBlueReply: job.blueReply ?? null, blueResponseMode: job.blueResponseMode, matchupId: job.matchupId, mirrorPairId: job.mirrorPairId }));
       control.onProgress({ ...progress(games, totalGames), currentOpening: job.opening });
     }
     if (control.isCancelled()) break;
@@ -263,7 +306,8 @@ interface PlayArgs {
   opening?: string;
   timeLimitMs?: number;
   forcedGreenOpening?: string;
-  forcedBlueReply?: string;
+  forcedBlueReply?: string | null;
+  blueResponseMode?: BlueResponseMode;
   matchupId?: string;
   mirrorPairId?: string;
 }
@@ -413,9 +457,11 @@ function playOne(args: PlayArgs): GameRecord {
     first10: labels.slice(0, 10).join(" "),
     opening: args.opening ?? labels[0],
     forcedGreenOpening: args.forcedGreenOpening,
-    forcedBlueReply: args.forcedBlueReply,
+    forcedBlueReply: args.forcedBlueReply ?? null,
+    blueResponseMode: args.blueResponseMode,
+    actualBlueFirstMove: labels[1] ?? null,
     greenOpeningLabel: args.forcedGreenOpening,
-    blueReplyLabel: args.forcedBlueReply,
+    blueReplyLabel: args.forcedBlueReply ?? null,
     matchupId: args.matchupId,
     mirrorPairId: args.mirrorPairId,
     requestedSearchDepth: args.searchDepth,
@@ -568,7 +614,7 @@ export function summarizeRecords(games: GameRecord[]) {
   };
 }
 
-function summarizeOpenings(games: GameRecord[], settings: OpeningSettings) {
+function summarizeOpenings(games: GameRecord[], settings: OpeningSettings | TargetedOpeningSettings) {
   const byOpening = new Map<string, GameRecord[]>();
   for (const game of games) byOpening.set(game.opening ?? "(unknown)", [...(byOpening.get(game.opening ?? "(unknown)") ?? []), game]);
   return [...byOpening.entries()].map(([opening, rows]) => ({
@@ -578,6 +624,9 @@ function summarizeOpenings(games: GameRecord[], settings: OpeningSettings) {
     blueWins: rows.filter((g) => g.winner === "blue").length,
     draws: rows.filter((g) => !g.winner).length,
     averagePlies: Number((rows.reduce((n, g) => n + g.plies, 0) / rows.length).toFixed(2)),
+    blueResponseMode: "blueResponseMode" in settings ? settings.blueResponseMode : ((settings as OpeningSettings).forceBlueReplies ? "forced" : "automatic"),
+    forcedBlueReply: mostCommon(rows.map((g) => g.forcedBlueReply ?? "(automatic)")),
+    actualBlueFirstMove: mostCommon(rows.map((g) => g.actualBlueFirstMove ?? g.moves[1] ?? "(none)")),
     mostCommonBlueReply: mostCommon(rows.map((g) => g.moves[1] ?? "(none)")),
     agents: `${settings.greenAgent} vs ${settings.blueAgent}`,
     diversity: `green ${settings.greenDiversity}, blue ${settings.blueDiversity}`,
@@ -594,8 +643,9 @@ function finalize(games: GameRecord[], positions: Array<Record<string, unknown>>
     runMode: mode,
     cancelled,
     allReplayVerified: summary.replayFailures === 0,
+    blueResponseMode: mode === "targeted" ? (settings as TargetedOpeningSettings).blueResponseMode : undefined,
   };
-  const summaryRows = games.map((g) => ({ id: g.id, seed: g.seed, winner: g.winner ?? "draw", drawReason: g.drawReason, plies: g.plies, replayOk: g.replayOk, opening: g.opening, forcedGreenOpening: g.forcedGreenOpening, forcedBlueReply: g.forcedBlueReply, greenOpeningLabel: g.greenOpeningLabel, blueReplyLabel: g.blueReplyLabel, matchupId: g.matchupId, mirrorPairId: g.mirrorPairId, requestedSearchDepth: g.requestedSearchDepth, completedSearchDepth: g.completedSearchDepth, nodesSearched: g.nodesSearched, leafEvaluations: g.leafEvaluations, alphaBetaCutoffs: g.alphaBetaCutoffs, transpositionTableHits: g.transpositionTableHits, searchElapsedMs: g.searchElapsedMs, timedOut: g.timedOut, principalVariation: g.principalVariation, gateContainmentDiagnostics: JSON.stringify(g.gateContainmentDiagnostics), repetitionDiagnostics: JSON.stringify(g.repetitionDiagnostics), selectedMoveDiagnostics: JSON.stringify(g.selectedMoveDiagnostics), uniquePositionsVisited: g.repetitionDiagnostics.uniquePositionsVisited, repeatedPositionsCount: g.repetitionDiagnostics.repeatedPositionsCount, maximumRepetitionCount: g.repetitionDiagnostics.maximumRepetitionCount, immediateReversals: g.repetitionDiagnostics.immediateReversals, twoPlyCycles: g.repetitionDiagnostics.twoPlyCycles, fourPlyCycles: g.repetitionDiagnostics.fourPlyCycles, noProgressPlies: g.repetitionDiagnostics.noProgressPlies, longestNoProgressStreak: g.repetitionDiagnostics.longestNoProgressStreak, repetitionDraw: g.repetitionDiagnostics.repetitionDraw, noProgressDraw: g.repetitionDiagnostics.noProgressDraw, firstRepeatingCyclePly: g.repetitionDiagnostics.firstRepeatingCyclePly, firstPickupPlayer: g.firstPickupPlayer, pickupPly: g.pickupPly, extractionFailure: g.extractionFailure, carrierRouted: g.carrierRouted }));
+  const summaryRows = games.map((g) => ({ id: g.id, seed: g.seed, winner: g.winner ?? "draw", drawReason: g.drawReason, plies: g.plies, replayOk: g.replayOk, opening: g.opening, forcedGreenOpening: g.forcedGreenOpening, blueResponseMode: g.blueResponseMode, forcedBlueReply: g.forcedBlueReply ?? null, actualBlueFirstMove: g.actualBlueFirstMove ?? null, greenOpeningLabel: g.greenOpeningLabel, blueReplyLabel: g.blueReplyLabel, matchupId: g.matchupId, mirrorPairId: g.mirrorPairId, requestedSearchDepth: g.requestedSearchDepth, completedSearchDepth: g.completedSearchDepth, nodesSearched: g.nodesSearched, leafEvaluations: g.leafEvaluations, alphaBetaCutoffs: g.alphaBetaCutoffs, transpositionTableHits: g.transpositionTableHits, searchElapsedMs: g.searchElapsedMs, timedOut: g.timedOut, principalVariation: g.principalVariation, gateContainmentDiagnostics: JSON.stringify(g.gateContainmentDiagnostics), repetitionDiagnostics: JSON.stringify(g.repetitionDiagnostics), selectedMoveDiagnostics: JSON.stringify(g.selectedMoveDiagnostics), uniquePositionsVisited: g.repetitionDiagnostics.uniquePositionsVisited, repeatedPositionsCount: g.repetitionDiagnostics.repeatedPositionsCount, maximumRepetitionCount: g.repetitionDiagnostics.maximumRepetitionCount, immediateReversals: g.repetitionDiagnostics.immediateReversals, twoPlyCycles: g.repetitionDiagnostics.twoPlyCycles, fourPlyCycles: g.repetitionDiagnostics.fourPlyCycles, noProgressPlies: g.repetitionDiagnostics.noProgressPlies, longestNoProgressStreak: g.repetitionDiagnostics.longestNoProgressStreak, repetitionDraw: g.repetitionDiagnostics.repetitionDraw, noProgressDraw: g.repetitionDiagnostics.noProgressDraw, firstRepeatingCyclePly: g.repetitionDiagnostics.firstRepeatingCyclePly, firstPickupPlayer: g.firstPickupPlayer, pickupPly: g.pickupPly, extractionFailure: g.extractionFailure, carrierRouted: g.carrierRouted }));
   const files: ExportFile[] = [
     { name: "games.jsonl", mime: "application/x-ndjson", content: jsonl(games) },
     { name: "positions.jsonl", mime: "application/x-ndjson", content: jsonl(positions) },

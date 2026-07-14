@@ -1,4 +1,4 @@
-import { targetedOpeningOptions, suspectedBlueFlagBearerPreset } from "./simulation-runner.ts";
+import { buildTargetedJobs, targetedForcedPairingCount, targetedOpeningOptions, suspectedBlueFlagBearerPreset, validateTargetedSettings } from "./simulation-runner.ts";
 import { AGENT_CHOICES, DEFAULT_SETTINGS, agentUsesDiversity, agentUsesSearchDepth, type SimulatorUiSettings } from "./config.ts";
 import type { AgentName } from "../../simulator/agents.ts";
 import { makeZip, type ExportFile } from "./exporters.ts";
@@ -20,7 +20,7 @@ app.innerHTML = `
   <main class="app-shell"><div class="main-stack">
     <section class="card"><h2>1. Simulation mode</h2><label><input type="radio" name="mode" value="standard" checked> Standard self-play</label><label><input type="radio" name="mode" value="opening"> Opening exploration</label><label><input type="radio" name="mode" value="targeted"> Targeted Opening Test</label></section>
     <section id="standard" class="card"><h2>2. Standard self-play settings</h2><div class="grid" id="standard-fields"></div></section>
-    <section id="opening" class="card hidden"><h2>3. Opening-exploration settings</h2><p class="warning">Forcing every Green opening and every Blue reply can create a very large run.</p><div class="grid" id="opening-fields"></div></section><section id="targeted" class="card hidden"><h2>4. Targeted Opening Test</h2><p class="warning">Select Green openings and Blue replies, or use the suspected Blue Flag Bearer preset.</p><div class="grid" id="targeted-fields"></div><details id="advanced-constraints"><summary><span>Advanced move constraints</span><small id="targeted-summary">No forced moves selected.</small></summary><div class="advanced-actions"><button id="targeted-preset" type="button">Test suspected Blue Flag Bearer replies</button><button id="targeted-all" type="button">Select all</button><button id="targeted-clear" type="button">Clear</button><button id="targeted-mirror" type="button">Select mirror pair</button></div><div id="targeted-moves" class="scroll-list"></div></details><p id="targeted-estimate"></p></section>
+    <section id="opening" class="card hidden"><h2>3. Opening-exploration settings</h2><p class="warning">Forcing every Green opening and every Blue reply can create a very large run.</p><div class="grid" id="opening-fields"></div></section><section id="targeted" class="card hidden"><h2>4. Targeted Opening Test</h2><p class="warning">Select Green openings, then choose whether Blue replies automatically or from forced replies.</p><div class="grid" id="targeted-fields"></div><details id="advanced-constraints"><summary><span>Advanced move constraints</span><small id="targeted-summary">No forced moves selected.</small></summary><div class="advanced-actions"><button id="targeted-preset" type="button">Test suspected Blue Flag Bearer replies</button><button id="targeted-all" type="button">Select all</button><button id="targeted-clear" type="button">Clear</button><button id="targeted-mirror" type="button">Select mirror pair</button></div><div id="targeted-moves" class="scroll-list"></div></details><p id="targeted-estimate"></p></section>
     <section class="card live-card"><h2>5. Live progress</h2><progress id="bar" value="0" max="100"></progress><div id="progress-text">No run started.</div></section>
     <section class="card"><h2>6. Results summary</h2><p class="warning">Simulation win rates measure these agents under the selected settings. They are not mathematical proof of game balance or a forced strategy.</p><div id="summary">No results yet.</div><div id="opening-table"></div></section>
     <section class="card"><h2>7. Downloads</h2><div id="downloads">Downloads appear after a completed or cancelled run.</div></section>
@@ -56,7 +56,8 @@ function renderForms(): void {
     select("Position sampling", "op-sampling", state.settings.opening.positionSampling, ["none", "final", "every-ply"]),
   ].join("");
   document.querySelector("#targeted-fields")!.innerHTML = [
-    input("Games per matchup", "tar-games", state.settings.targeted.gamesPerMatchup, "number", "Every selected opening/reply pair is forced this many times."),
+    select("Blue response mode", "tar-blue-mode", state.settings.targeted.blueResponseMode, ["automatic", "forced"]),
+    input(state.settings.targeted.blueResponseMode === "automatic" ? "Games per Green opening" : "Games per pairing", "tar-games", state.settings.targeted.gamesPerMatchup, "number", state.settings.targeted.blueResponseMode === "automatic" ? "Each selected Green opening is forced this many times; Blue chooses its own reply." : "Every selected opening/reply pair is forced this many times."),
     selectAgent("Green agent", "tar-green", state.settings.targeted.greenAgent),
     selectAgent("Blue agent", "tar-blue", state.settings.targeted.blueAgent),
     input("Search depth", "tar-depth", state.settings.targeted.searchDepth, "number", "Used by search agents."),
@@ -71,7 +72,7 @@ function renderForms(): void {
 }
 
 function wireEvents(): void {
-  app.addEventListener("change", () => { readForms(); updateApplicability(); });
+  app.addEventListener("change", (event) => { const changedId = (event.target as HTMLElement).id; readForms(); if (changedId === "tar-blue-mode") renderForms(); updateApplicability(); });
   document.querySelector("#start")!.addEventListener("click", start);
   document.querySelector("#pause")!.addEventListener("click", () => send({ type: "pause" }));
   document.querySelector("#resume")!.addEventListener("click", () => send({ type: "resume" }));
@@ -92,17 +93,21 @@ function readForms(): void {
   state.settings.opening = {
     gamesPerOpening: num("op-games"), forceBlueReplies: checked("op-force"), greenAgent: agent("op-green"), blueAgent: agent("op-blue"), searchDepth: num("op-depth"), greenDiversity: div("op-green-div"), blueDiversity: div("op-blue-div"), seed: num("op-seed"), maxPlies: num("op-max"), positionSampling: val("op-sampling") as any,
   };
-  state.settings.targeted = { ...state.settings.targeted, gamesPerMatchup: num("tar-games"), greenAgent: agent("tar-green"), blueAgent: agent("tar-blue"), searchDepth: num("tar-depth"), greenDiversity: div("tar-green-div"), blueDiversity: div("tar-blue-div"), seed: num("tar-seed"), maxPlies: num("tar-max"), timeLimitMs: num("tar-time"), positionSampling: val("tar-sampling") as any };
+  state.settings.targeted = { ...state.settings.targeted, blueResponseMode: val("tar-blue-mode") as any, gamesPerMatchup: num("tar-games"), greenAgent: agent("tar-green"), blueAgent: agent("tar-blue"), searchDepth: num("tar-depth"), greenDiversity: div("tar-green-div"), blueDiversity: div("tar-blue-div"), seed: num("tar-seed"), maxPlies: num("tar-max"), timeLimitMs: num("tar-time"), positionSampling: val("tar-sampling") as any };
 }
 
 function updateApplicability(): void {
   document.querySelector("#standard")!.classList.toggle("hidden", state.settings.mode !== "standard");
   document.querySelector("#opening")!.classList.toggle("hidden", state.settings.mode !== "opening");
   document.querySelector("#targeted")!.classList.toggle("hidden", state.settings.mode !== "targeted");
-  const matchupCount = Object.values(state.settings.targeted.selectedBlueRepliesByOpening).reduce((n, a) => n + a.length, 0);
-  document.querySelector("#targeted-estimate")!.textContent = `Estimated total games: ${matchupCount * state.settings.targeted.gamesPerMatchup}`;
   const openingCount = state.settings.targeted.selectedGreenOpenings.length;
-  document.querySelector("#targeted-summary")!.textContent = openingCount || matchupCount ? `${openingCount} openings, ${matchupCount} replies selected` : "No forced moves selected.";
+  const forcedPairings = targetedForcedPairingCount(state.settings.targeted);
+  const jobCount = buildTargetedJobs(state.settings.targeted).length;
+  const totalGames = jobCount * state.settings.targeted.gamesPerMatchup;
+  const modeText = state.settings.targeted.blueResponseMode === "automatic" ? "Automatic: Blue agent chooses reply" : "Forced: test selected Blue replies";
+  document.querySelector("#targeted-estimate")!.textContent = `Selected Green openings: ${openingCount} • Response mode: ${modeText} • ${state.settings.targeted.blueResponseMode === "forced" ? `Forced reply pairings: ${forcedPairings} • ` : ""}Estimated total games: ${totalGames}`;
+  document.querySelector("#targeted-summary")!.textContent = openingCount || forcedPairings ? `${openingCount} openings • ${modeText}${state.settings.targeted.blueResponseMode === "forced" ? ` • ${forcedPairings} forced pairings` : ""}` : "No Green openings selected.";
+  document.querySelector("#targeted-moves")?.classList.toggle("muted", state.settings.targeted.blueResponseMode === "automatic");
   for (const [agentId, divId] of [["std-green", "std-green-div"], ["std-blue", "std-blue-div"], ["op-green", "op-green-div"], ["op-blue", "op-blue-div"], ["tar-green", "tar-green-div"], ["tar-blue", "tar-blue-div"]]) {
     document.querySelector(`#${divId}`)?.closest("label")?.classList.toggle("muted", !agentUsesDiversity(agent(agentId)));
   }
@@ -113,6 +118,10 @@ function updateApplicability(): void {
 
 function start(): void {
   readForms();
+  if (state.settings.mode === "targeted") {
+    const errors = validateTargetedSettings(state.settings.targeted);
+    if (errors.length) { document.querySelector("#summary")!.textContent = errors.join(" "); return; }
+  }
   state.worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
   state.startedAt = performance.now();
   state.result = null;
@@ -169,7 +178,9 @@ function renderTargetedMoves() {
   const el = document.querySelector("#targeted-moves"); if (!el) return;
   const options = targetedOpeningOptions();
   if (!document.querySelector<HTMLDetailsElement>("#advanced-constraints")?.open) { el.innerHTML = ""; return; }
-  el.innerHTML = options.map((o) => `<fieldset><legend><label><input type="checkbox" data-green="${o.label}" ${state.settings.targeted.selectedGreenOpenings.includes(o.label) ? "checked" : ""}>${o.label}</label></legend>${o.replies.map((r) => `<label><input type="checkbox" data-opening="${o.label}" data-reply="${r.label}" ${(state.settings.targeted.selectedBlueRepliesByOpening[o.label] ?? []).includes(r.label) ? "checked" : ""}>${r.label}</label>`).join("")}</fieldset>`).join("");
+  const automatic = state.settings.targeted.blueResponseMode === "automatic";
+  const explanation = automatic ? `<p class="warning">Automatic mode: Blue is not forced; the selected Blue agent chooses its own first move. Saved forced-reply selections are ignored until Forced mode is selected again.</p>` : `<p class="warning">Forced mode: choose at least one legal Blue reply for every selected Green opening.</p>`;
+  el.innerHTML = explanation + options.map((o) => `<fieldset><legend><label><input type="checkbox" data-green="${o.label}" ${state.settings.targeted.selectedGreenOpenings.includes(o.label) ? "checked" : ""}>${o.label}</label></legend><div class="${automatic ? "muted" : ""}">${o.replies.map((r) => `<label><input type="checkbox" data-opening="${o.label}" data-reply="${r.label}" ${automatic ? "disabled" : ""} ${(state.settings.targeted.selectedBlueRepliesByOpening[o.label] ?? []).includes(r.label) ? "checked" : ""}>${r.label}</label>`).join("")}</div></fieldset>`).join("");
   el.querySelectorAll<HTMLInputElement>("input[data-green]").forEach((box) => box.onchange = () => { const label = box.dataset.green!; state.settings.targeted.selectedGreenOpenings = box.checked ? [...new Set([...state.settings.targeted.selectedGreenOpenings, label])] : state.settings.targeted.selectedGreenOpenings.filter((x) => x !== label); updateApplicability(); });
   el.querySelectorAll<HTMLInputElement>("input[data-reply]").forEach((box) => box.onchange = () => { const opening = box.dataset.opening!, reply = box.dataset.reply!; const current = state.settings.targeted.selectedBlueRepliesByOpening[opening] ?? []; state.settings.targeted.selectedBlueRepliesByOpening[opening] = box.checked ? [...new Set([...current, reply])] : current.filter((x) => x !== reply); updateApplicability(); });
 }
