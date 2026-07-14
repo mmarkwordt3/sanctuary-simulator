@@ -34,7 +34,7 @@ class MemoryTransaction {
   oncomplete: Handler = null;
   onerror: Handler = null;
   onabort: Handler = null;
-  constructor(private db: MemoryDB, private stores: string | string[]) { setTimeout(() => this.oncomplete?.({ target: this }), 20); }
+  constructor(private db: MemoryDB, private stores: string | string[]) { setTimeout(() => this.oncomplete?.({ target: this }), 75); }
   objectStore(name: string) { return this.db.stores.get(name)! as any; }
 }
 

@@ -18,3 +18,14 @@ describe("experiment worker and replay UI integration", () => {
     for (const token of ["data-replay=\"start\"", "data-replay=\"prev\"", "data-replay=\"play\"", "data-replay=\"pause\"", "data-replay=\"next\"", "data-replay=\"end\"", "data-replay-speed", "replay-grid"]) expect(main).toContain(token);
   });
 });
+
+describe("Phase 2 analysis UI controls", () => {
+  it("exposes comparison, table-control, editable proposal, and auto-analysis UI", () => {
+    const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    for (const token of ["comparison-ui", "compare-source", "data-compare-target", "run-comparison", "compatibilityFields", "Warning: incompatible settings"]) expect(main).toContain(token);
+    for (const token of ["data-analysis-control=\"openingSort\"", "openingFlagged", "mirrorSampled", "replyDominant", "flagCategory", "flagDismissed", "slice(0,50)"]) expect(main).toContain(token);
+    for (const token of ["proposal-editor", "proposal-openings", "proposal-replies", "submit-proposal", "Estimated total games", "Fields changed from source"]) expect(main).toContain(token);
+    expect(main).toContain("exp-auto-analysis");
+    expect(main).toContain("maybeAutoAnalyzeExperiment");
+  });
+});
