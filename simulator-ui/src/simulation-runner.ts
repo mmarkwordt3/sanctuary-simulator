@@ -1,6 +1,6 @@
 import { createInitialState } from "../../src/game/setup.ts";
 import { applyMove } from "../../src/game/reducer.ts";
-import { fromCoord } from "../../src/game/coords.ts";
+import { COLUMNS, fromCoord } from "../../src/game/coords.ts";
 import type { GameState, Move } from "../../src/game/types.ts";
 import {
   type AgentName,
@@ -122,7 +122,7 @@ export async function runStandard(settings: StandardSettings, control: RunnerCon
   for (let i = 0; i < settings.games; i++) {
     await control.waitIfPaused();
     if (control.isCancelled()) break;
-    games.push(playOne({
+    games.push(playExperimentGame({
       id: i + 1,
       seed: settings.seed + i,
       greenAgent: settings.greenAgent,
@@ -226,7 +226,7 @@ export async function runTargetedOpening(settings: TargetedOpeningSettings, cont
     for (const job of jobGroup) for (let i = 0; i < settings.gamesPerMatchup; i++) {
       await control.waitIfPaused();
       if (control.isCancelled()) break;
-      games.push(playOne({ id: id++, seed: settings.seed + games.length, greenAgent: settings.greenAgent, blueAgent: settings.blueAgent, greenDiversity: settings.greenDiversity, blueDiversity: settings.blueDiversity, searchDepth: settings.searchDepth, timeLimitMs: settings.timeLimitMs, maxPlies: settings.maxPlies, noProgressPlyLimit: settings.noProgressPlyLimit ?? 40, positionSampling: settings.positionSampling, positions, forcedPrefix: job.prefix, opening: job.opening, forcedGreenOpening: job.opening, forcedBlueReply: job.blueReply ?? null, blueResponseMode: job.blueResponseMode, matchupId: job.matchupId, mirrorPairId: job.mirrorPairId }));
+      games.push(playExperimentGame({ id: id++, seed: settings.seed + games.length, greenAgent: settings.greenAgent, blueAgent: settings.blueAgent, greenDiversity: settings.greenDiversity, blueDiversity: settings.blueDiversity, searchDepth: settings.searchDepth, timeLimitMs: settings.timeLimitMs, maxPlies: settings.maxPlies, noProgressPlyLimit: settings.noProgressPlyLimit ?? 40, positionSampling: settings.positionSampling, positions, forcedPrefix: job.prefix, opening: job.opening, forcedGreenOpening: job.opening, forcedBlueReply: job.blueReply ?? null, blueResponseMode: job.blueResponseMode, matchupId: job.matchupId, mirrorPairId: job.mirrorPairId }));
       control.onProgress({ ...progress(games, totalGames), currentOpening: job.opening });
     }
     if (control.isCancelled()) break;
@@ -255,7 +255,7 @@ export async function runOpening(settings: OpeningSettings, control: RunnerContr
     for (let i = 0; i < settings.gamesPerOpening; i++) {
       await control.waitIfPaused();
       if (control.isCancelled()) break;
-      games.push(playOne({
+      games.push(playExperimentGame({
         id: id++,
         seed: settings.seed + pairIndex * settings.gamesPerOpening + i,
         greenAgent: settings.greenAgent,
@@ -313,7 +313,7 @@ interface PlayArgs {
 }
 
 export function runForcedLineForRepetitionTest(forcedPrefix: Move[], maxPlies = 100, noProgressPlyLimit = 40): GameRecord {
-  return playOne({
+  return playExperimentGame({
     id: 1,
     seed: 1,
     greenAgent: "random",
@@ -329,7 +329,7 @@ export function runForcedLineForRepetitionTest(forcedPrefix: Move[], maxPlies = 
   });
 }
 
-function playOne(args: PlayArgs): GameRecord {
+export function playExperimentGame(args: PlayArgs): GameRecord {
   let state = createInitialState();
   const seen = new Map<string, number>();
   seen.set(positionKey(state), 1);
@@ -552,7 +552,7 @@ function moveLabel(state: GameState, move: Move): string {
   return `${move.pieceId}:${fromCoord(piece)}-${fromCoord(move.to)}`;
 }
 
-function replayVerify(moves: Move[], expected: GameState): boolean {
+export function replayVerify(moves: Move[], expected: GameState): boolean {
   let state = createInitialState();
   for (const move of moves) {
     const next = applyMove(state, move);
@@ -670,4 +670,35 @@ function mostCommon(values: string[]): string {
 
 export function defaultStandardSettings(): StandardSettings {
   return structuredClone(DEFAULT_SETTINGS.standard);
+}
+
+export function replayStoredGame(game: Pick<GameRecord, "moves">): { ok: boolean; state: GameState; failedAt?: number } {
+  let state = createInitialState();
+  for (let i = 0; i < game.moves.length; i++) {
+    const match = /^(.*?):([A-M])(\d+)-([A-M])(\d+)$/.exec(game.moves[i]);
+    if (!match) return { ok: false, state, failedAt: i + 1 };
+    const move = { pieceId: match[1], to: { col: COLUMNS.indexOf(match[4]), row: Number(match[5]) - 1 } };
+    const next = applyMove(state, move);
+    if (next === state) return { ok: false, state, failedAt: i + 1 };
+    state = next;
+  }
+  return { ok: true, state };
+}
+
+export function replayStoredGameTimeline(game: Pick<GameRecord, "moves">): { ok: boolean; states: GameState[]; failedAt?: number; previousMoves: Array<{ pieceId: string; from: { col: number; row: number }; to: { col: number; row: number } } | null> } {
+  let state = createInitialState();
+  const states: GameState[] = [state];
+  const previousMoves: Array<{ pieceId: string; from: { col: number; row: number }; to: { col: number; row: number } } | null> = [null];
+  for (let i = 0; i < game.moves.length; i++) {
+    const match = /^(.*?):([A-M])(\d+)-([A-M])(\d+)$/.exec(game.moves[i]);
+    if (!match) return { ok: false, states, failedAt: i + 1, previousMoves };
+    const from = { col: COLUMNS.indexOf(match[2]), row: Number(match[3]) - 1 };
+    const move = { pieceId: match[1], to: { col: COLUMNS.indexOf(match[4]), row: Number(match[5]) - 1 } };
+    const next = applyMove(state, move);
+    if (next === state) return { ok: false, states, failedAt: i + 1, previousMoves };
+    state = next;
+    states.push(state);
+    previousMoves.push({ pieceId: move.pieceId, from, to: move.to });
+  }
+  return { ok: true, states, previousMoves };
 }

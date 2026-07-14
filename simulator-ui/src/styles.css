@@ -32,3 +32,6 @@ details#advanced-constraints summary small { font-weight: 500; opacity: .75; }
 .scroll-list fieldset { margin: .5rem 0; border: 1px solid #d6c8b4; border-radius: 8px; }
 @media (max-width: 860px) { .app-shell { grid-template-columns: 1fr; padding-bottom: 10rem; } .run-panel { position: fixed; left: 0; right: 0; bottom: 0; top: auto; z-index: 10; border-radius: 12px 12px 0 0; display: grid; grid-template-columns: repeat(5, 1fr); gap: .35rem; } .run-panel h2, .mini-progress { grid-column: 1 / -1; margin: 0; } }
 @media (prefers-color-scheme: dark) { .run-panel { background: #2b261f; } }
+.replay-grid { border-collapse: collapse; margin-top: 0.75rem; }
+.replay-grid td { width: 2rem; height: 2rem; border: 1px solid #334155; text-align: center; font-size: 0.75rem; }
+.replay-grid .last-move { background: #fde68a; color: #111827; }
