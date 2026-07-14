@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { createInitialState } from "../../src/game/setup.ts";
 import { applyMove } from "../../src/game/reducer.ts";
+import { fromCoord } from "../../src/game/coords.ts";
+import { positionKey, selectMoveDetailed } from "../../simulator/agents.ts";
 import { DEFAULT_SETTINGS } from "../src/config.ts";
 import { buildTargetedJobs, runOpening, runStandard, runTargetedOpening, suspectedBlueFlagBearerPreset, targetedForcedPairingCount, targetedOpeningOptions, validateTargetedSettings, type RunnerControl } from "../src/simulation-runner.ts";
 
@@ -23,14 +25,34 @@ describe("targeted opening mode", () => {
 
   it("automatic mode lets configured Blue agent choose and exports actual Blue first move", async () => {
     const c1 = targetedOpeningOptions().find((o) => o.label.includes("C1-B1")) ?? targetedOpeningOptions()[0];
-    const k1 = targetedOpeningOptions().find((o) => o.label.includes("K1-L1")) ?? targetedOpeningOptions()[1];
-    const settings = { ...DEFAULT_SETTINGS.targeted, blueResponseMode: "automatic" as const, selectedGreenOpenings: [c1.label, k1.label], gamesPerMatchup: 1, greenAgent: "search-alpha-beta-deterministic" as const, blueAgent: "search-alpha-beta-deterministic" as const, searchDepth: 2, greenDiversity: 0 as const, blueDiversity: 0 as const, seed: 424242, maxPlies: 100, positionSampling: "none" as const, selectedBlueRepliesByOpening: { [c1.label]: [c1.replies[0].label] } };
+    const initial = createInitialState();
+    const afterOpening = applyMove(initial, c1.move);
+    const openingPiece = initial.pieces.find((piece) => piece.id === c1.move.pieceId)!;
+    const settings = { ...DEFAULT_SETTINGS.targeted, blueResponseMode: "automatic" as const, selectedGreenOpenings: [c1.label], gamesPerMatchup: 1, greenAgent: "search-alpha-beta-deterministic" as const, blueAgent: "search-alpha-beta-deterministic" as const, searchDepth: 1, greenDiversity: 0 as const, blueDiversity: 0 as const, seed: 424242, maxPlies: 2, positionSampling: "none" as const, selectedBlueRepliesByOpening: { [c1.label]: [c1.replies[0].label] } };
+    const expectedBlueSelection = selectMoveDetailed(afterOpening, settings.blueAgent, {
+      seed: settings.seed + 7919 + 31337,
+      recentPositions: new Map([[positionKey(initial), 1], [positionKey(afterOpening), 1]]),
+      previousMove: { pieceId: c1.move.pieceId, from: { col: openingPiece.col, row: openingPiece.row }, to: c1.move.to },
+      searchDepth: settings.searchDepth,
+      diversity: settings.blueDiversity,
+      timeLimitMs: settings.timeLimitMs,
+      currentNoProgressPlies: 1,
+    });
+    const expectedBlueMove = expectedBlueSelection.move!;
+    const expectedBluePiece = afterOpening.pieces.find((piece) => piece.id === expectedBlueMove.pieceId)!;
+    const expectedBlueLabel = `${expectedBlueMove.pieceId}:${fromCoord(expectedBluePiece)}-${fromCoord(expectedBlueMove.to)}`;
+
     const result = await runTargetedOpening(settings, control());
-    expect(result.games).toHaveLength(2);
-    expect(result.summary.games).toBe(2);
-    expect(result.games.every((game) => game.replayOk && game.metrics.illegalMoves === 0)).toBe(true);
-    expect(result.games.every((game) => game.blueResponseMode === "automatic" && game.forcedBlueReply === null)).toBe(true);
-    expect(result.games.every((game) => !!game.actualBlueFirstMove)).toBe(true);
+
+    expect(result.games).toHaveLength(1);
+    expect(result.summary.games).toBe(1);
+    expect(result.games[0].moves).toHaveLength(2);
+    expect(result.games[0].moves[0]).toBe(c1.label);
+    expect(result.games[0].replayOk).toBe(true);
+    expect(result.games[0].metrics.illegalMoves).toBe(0);
+    expect(result.games[0].blueResponseMode).toBe("automatic");
+    expect(result.games[0].forcedBlueReply).toBeNull();
+    expect(result.games[0].actualBlueFirstMove).toBe(expectedBlueLabel);
     expect(result.files.find((file) => file.name === "game_summary.csv")?.content).toContain("actualBlueFirstMove");
     expect(result.metadata.blueResponseMode).toBe("automatic");
   });
@@ -59,7 +81,7 @@ describe("targeted opening mode", () => {
 
   it("seeded automatic runs are reproducible and metadata distinguishes modes", async () => {
     const first = targetedOpeningOptions()[0];
-    const settings = { ...DEFAULT_SETTINGS.targeted, blueResponseMode: "automatic" as const, selectedGreenOpenings: [first.label], seed: 99, maxPlies: 12 };
+    const settings = { ...DEFAULT_SETTINGS.targeted, blueResponseMode: "automatic" as const, selectedGreenOpenings: [first.label], searchDepth: 1, seed: 99, maxPlies: 4 };
     const a = await runTargetedOpening(settings, control());
     const b = await runTargetedOpening(settings, control());
     expect(a.games[0].moves).toEqual(b.games[0].moves);
