@@ -2,6 +2,7 @@ import type { AgentName, DiversityLevel } from "../../simulator/agents.ts";
 
 export type SimulationMode = "standard" | "opening" | "targeted";
 export type PositionSampling = "none" | "final" | "every-ply";
+export type BlueResponseMode = "automatic" | "forced";
 
 export interface StandardSettings {
   games: number;
@@ -32,6 +33,7 @@ export interface OpeningSettings {
 
 export interface TargetedOpeningSettings {
   gamesPerMatchup: number;
+  blueResponseMode: BlueResponseMode;
   greenAgent: AgentName;
   blueAgent: AgentName;
   searchDepth: number;
@@ -93,6 +95,7 @@ export const DEFAULT_SETTINGS: SimulatorUiSettings = {
   },
   targeted: {
     gamesPerMatchup: 1,
+    blueResponseMode: "automatic",
     greenAgent: "search-alpha-beta-deterministic",
     blueAgent: "search-alpha-beta-deterministic",
     greenDiversity: 1,

@@ -87,11 +87,20 @@ describe("simulation repetition termination", () => {
     expect(result.games[0].repetitionDiagnostics.noProgressDraw).toBe(true);
   });
 
-  it("immediate-reversal diagnostics still work after lastMove is removed from positionKey", () => {
+  it("immediate-reversal diagnostics count each legitimately played reversal once", () => {
     const [m1, m2, m3] = fourPlyCycle();
     const result = runForcedLineForRepetitionTest([m1, m2, m3], 100, 40);
-    expect(result.repetitionDiagnostics.immediateReversals).toBe(1);
-    expect(result.selectedMoveDiagnostics[2].reversedPreviousMove).toBe(true);
+    const reversedMoves = result.selectedMoveDiagnostics
+      .filter((diagnostic) => diagnostic.reversedPreviousMove)
+      .map((diagnostic) => diagnostic.move);
+
+    expect(reversedMoves).toEqual([
+      "green-spear-1:B1-C1",
+      "blue-horse-1:F10-G12",
+      "blue-guard-2:I12-I11",
+      "blue-flagBearer-1:E11-E12",
+    ]);
+    expect(result.repetitionDiagnostics.immediateReversals).toBe(reversedMoves.length);
   });
 });
 
