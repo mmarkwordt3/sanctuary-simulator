@@ -1,15 +1,19 @@
 import { buildTargetedJobs, replayStoredGameTimeline, targetedForcedPairingCount, targetedOpeningOptions, suspectedBlueFlagBearerPreset, validateTargetedSettings } from "./simulation-runner.ts";
 import { AGENT_CHOICES, DEFAULT_SETTINGS, agentUsesDiversity, agentUsesSearchDepth, type SimulatorUiSettings } from "./config.ts";
 import type { AgentName } from "../../simulator/agents.ts";
-import { makeZip, type ExportFile } from "./exporters.ts";
+import { type ExportFile } from "./exporters.ts";
+import { triggerDownloadFile, triggerDownloadZip } from "./downloads.ts";
 import { ExperimentStore, estimateExperiment, exportExperiment, replayStoredGame, type CompletedGameRecord, type ExperimentSettings, type GameQuery, type GameJobRecord } from "./experiments.ts";
 import { compareExperiments, type AnalysisFlag, type ExperimentAnalysis, type FollowUpProposal } from "./analysis.ts";
 import type { ExperimentWorkerResponse } from "./experiment-worker.ts";
 import type { RunResult } from "./simulation-runner.ts";
 import type { WorkerRequest, WorkerResponse } from "./worker.ts";
+import { acceptanceTuningSettings, DEFAULT_MIRRORED_OPENING_SUITE } from "../../simulator/tuning.ts";
+import { TuningStore, type TuningSnapshot } from "./tuning-store.ts";
 import "./styles.css";
 
 const experimentStore = new ExperimentStore();
+const tuningStore = new TuningStore();
 let activeExperimentRun: { experimentId: string; pauseRequested: boolean; cancelRequested: boolean; running: boolean; worker: Worker | null } | null = null;
 let currentExperimentView: { experimentId: string; page: number; pageSize: number; query: GameQuery; replayTimer: number | null; replayPly: number } | null = null;
 const state: { settings: SimulatorUiSettings; worker: Worker | null; result: RunResult | null; startedAt: number; paused: boolean } = {
@@ -31,13 +35,23 @@ app.innerHTML = `
     <section class="card"><h2>6. Results summary</h2><p class="warning">Simulation win rates measure these agents under the selected settings. They are not mathematical proof of game balance or a forced strategy.</p><div id="summary">No results yet.</div><div id="opening-table"></div></section>
     <section class="card"><h2>7. Downloads</h2><div id="downloads">Downloads appear after a completed or cancelled run.</div></section>
     <section class="card"><h2>8. Automated Experiments</h2><p class="warning">Browser-local Phase 1: experiments persist in IndexedDB and can resume after reload, but computation does not continue while the tab is closed, suspended, the device sleeps, or the computer is off.</p><div class="grid"><label>Experiment name<input id="exp-name" value="Automated Self-Play Acceptance"></label><label><input id="exp-auto-analysis" type="checkbox"> Run analysis automatically when experiment completes</label></div><p class="warning">Auto-analysis is off by default so long experiments finish without extra work; enable it to analyze once after completion.</p><p id="exp-estimate"></p><button id="exp-create">Create persisted experiment from current settings</button><div id="experiment-dashboard">Loading experiments…</div><div id="experiment-detail"></div></section>
-    <section class="card"><h2>9. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
+
+    <section class="card"><h2>9. Evolutionary Tuning</h2><p class="warning">Browser-local Phase 3: one tuning worker runs one match at a time. Candidates never replace the production profile automatically; promotion requires explicit approval.</p><div class="grid"><label>Tuning run name<input id="tune-name" value="Evolution Acceptance"></label><label>Baseline evaluation profile<input id="tune-baseline" value="production-baseline-v1" readonly></label><label>Candidate count<input id="tune-candidates" type="number" value="8"></label><label>Generations<input id="tune-generations" type="number" value="2"></label><label>Search depth<input id="tune-depth" type="number" value="2"></label><label>Games per matchup<input id="tune-games" type="number" value="1"></label><label>Seed count<input id="tune-seeds" type="number" value="4"></label><label>Seed start<input id="tune-seed-start" type="number" value="1"></label><label>Mutation rate<input id="tune-rate" type="number" step="0.05" value="0.55"></label><label>Mutation magnitude<input id="tune-magnitude" type="number" step="0.05" value="0.25"></label><label>Elite count<input id="tune-elites" type="number" value="2"></label><label>Parent selection<select id="tune-parent"><option>rank</option><option>tournament</option></select></label><label><input id="tune-mirrored" type="checkbox" checked> Mirrored openings required</label><label><input id="tune-baseline-matches" type="checkbox" checked> Candidate-vs-baseline matches</label><label><input id="tune-peer-matches" type="checkbox" checked> Candidate-vs-candidate compact peer matches</label><label><input id="tune-auto-pause" type="checkbox" checked> Auto-pause after each generation</label><label>Maximum plies<input id="tune-max-plies" type="number" value="40"></label><label>No-progress limit<input id="tune-no-progress" type="number" value="24"></label><label>Time limit / move ms<input id="tune-time-limit" type="number" value="0"></label></div><label>Opening suite<textarea id="tune-openings">C1-B1
+K1-L1
+D3-E3
+J3-I3
+D3-D4
+J3-J4
+E1-F1
+I1-H1</textarea></label><p id="tune-estimate"></p><button id="tune-create">Create tuning run</button><button id="tune-acceptance">Run real acceptance scenario</button><div id="tune-dashboard"></div><div id="tune-profile-info"></div></section>
+    <section class="card"><h2>10. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
   </div><aside class="run-panel" aria-label="Run controls"><h2>Run Simulation</h2><button id="start">Start</button><button id="pause" disabled>Pause</button><button id="resume" disabled>Resume</button><button id="cancel" disabled>Cancel</button><button id="reset">Reset</button><div class="mini-progress"><progress id="sticky-bar" value="0" max="100"></progress><div id="sticky-progress-text">No run started.</div></div></aside></main>`;
 
 renderForms();
 wireEvents();
 updateApplicability();
 experimentStore.pauseRecovery().then(renderExperiments).catch(console.error);
+tuningStore.recoverInterruptedTuningRuns().then(() => renderTuningRuns()).catch(console.error);
 
 function renderForms(): void {
   document.querySelector("#standard-fields")!.innerHTML = [
@@ -87,6 +101,9 @@ function wireEvents(): void {
   document.querySelector("#cancel")!.addEventListener("click", () => send({ type: "cancel" }));
   document.querySelector("#reset")!.addEventListener("click", reset);
   document.querySelector("#exp-create")!.addEventListener("click", createAutomatedExperiment);
+  document.querySelector("#tune-create")!.addEventListener("click", createTuningRunDraft);
+  document.querySelector("#tune-acceptance")!.addEventListener("click", runTuningAcceptance);
+  document.querySelector("#tune-dashboard")!.addEventListener("click", tuningAction);
   document.querySelector("#experiment-dashboard")!.addEventListener("click", experimentAction);
   document.querySelector("#experiment-detail")!.addEventListener("click", experimentDetailAction);
   document.querySelector("#experiment-detail")!.addEventListener("change", experimentDetailChanged);
@@ -121,6 +138,7 @@ function updateApplicability(): void {
   document.querySelector("#targeted-summary")!.textContent = openingCount || forcedPairings ? `${openingCount} openings • ${modeText}${state.settings.targeted.blueResponseMode === "forced" ? ` • ${forcedPairings} forced pairings` : ""}` : "No Green openings selected.";
   document.querySelector("#targeted-moves")?.classList.toggle("muted", state.settings.targeted.blueResponseMode === "automatic");
   updateExperimentEstimate();
+  updateTuningEstimate();
   for (const [agentId, divId] of [["std-green", "std-green-div"], ["std-blue", "std-blue-div"], ["op-green", "op-green-div"], ["op-blue", "op-blue-div"], ["tar-green", "tar-green-div"], ["tar-blue", "tar-blue-div"]]) {
     document.querySelector(`#${divId}`)?.closest("label")?.classList.toggle("muted", !agentUsesDiversity(agent(agentId)));
   }
@@ -172,11 +190,11 @@ function renderDownloads(files: ExportFile[]): void {
   const zip = { name: "sanctuary-simulator-results.zip", mime: "application/zip", content: "" };
   document.querySelector("#downloads")!.innerHTML = files.map((f, i) => `<button data-file="${i}">${f.name}</button>`).join("") + `<button data-zip="1">ZIP containing all results</button>`;
   document.querySelectorAll<HTMLButtonElement>("[data-file]").forEach((button) => button.addEventListener("click", () => download(files[Number(button.dataset.file)])));
-  document.querySelector<HTMLButtonElement>("[data-zip]")!.addEventListener("click", () => downloadBlob(zip.name, makeZip(files)));
+  document.querySelector<HTMLButtonElement>("[data-zip]")!.addEventListener("click", () => { try { setDownloadFeedback(`Downloaded ${triggerDownloadZip(zip.name, files).filename}.`); } catch (err) { setDownloadFeedback(err instanceof Error ? err.message : String(err), true); } });
 }
 
-function download(file: ExportFile): void { downloadBlob(file.name, new Blob([file.content], { type: file.mime })); }
-function downloadBlob(name: string, blob: Blob): void { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click(); URL.revokeObjectURL(a.href); }
+function download(file: ExportFile): void { setDownloadFeedback(`Downloaded ${triggerDownloadFile(file).filename}.`); }
+function setDownloadFeedback(message: string, error = false): void { const el = document.querySelector("#downloads"); if (el) el.insertAdjacentHTML("afterbegin", `<p class="${error ? "warning" : "success"}">${message}</p>`); const tuning = document.querySelector("#tune-profile-info"); if (tuning) tuning.textContent = message; }
 function input(label: string, id: string, value: number, type: string, title: string): string { return `<label title="${title}">${label}<input id="${id}" type="${type}" value="${value}"></label>`; }
 function checkbox(label: string, id: string, value: boolean): string { return `<label>${label}<input id="${id}" type="checkbox" ${value ? "checked" : ""}></label>`; }
 function selectAgent(label: string, id: string, value: AgentName): string { return select(label, id, value, AGENT_CHOICES); }
@@ -237,7 +255,7 @@ async function experimentAction(event: Event): Promise<void> {
     }
     await experimentStore.cancelExperiment(experimentId);
   }
-  if (action === "export") return downloadBlob(`${experimentId}.zip`, makeZip(await exportExperiment(experimentStore, experimentId)));
+  if (action === "export") { try { setDownloadFeedback(`Downloaded ${triggerDownloadZip(`${experimentId}.zip`, await exportExperiment(experimentStore, experimentId)).filename}.`); } catch (err) { setDownloadFeedback(err instanceof Error ? err.message : String(err), true); } return; }
   if (action === "retry") await experimentStore.retryFailedJobs(experimentId);
   if (action === "delete" && confirm("Delete this experiment, jobs, and games?")) await experimentStore.deleteExperiment(experimentId);
   await renderExperiments();
@@ -404,4 +422,75 @@ function boardHtml(state: any, prev: any): string {
 function summarizeStoredGames(games: Array<{ plies: number; finalReplayOk: boolean; repetitionDiagnostics: any }>) {
   const plies = games.map(g => g.plies).sort((a, b) => a - b);
   return { averagePlies: Number((plies.reduce((a, b) => a + b, 0) / Math.max(1, plies.length)).toFixed(2)), medianPlies: plies.length ? plies[Math.floor((plies.length - 1) / 2)] : 0, replayFailures: games.filter(g => !g.finalReplayOk).length, repetitionDraws: games.filter(g => g.repetitionDiagnostics?.repetitionDraw).length, noProgressDraws: games.filter(g => g.repetitionDiagnostics?.noProgressDraw).length };
+}
+
+function currentTuningSettings() {
+  const base = acceptanceTuningSettings();
+  const seeds = Array.from({length: Math.max(1, num("tune-seeds"))}, (_, i) => num("tune-seed-start") + i);
+  return { ...base, name: (document.querySelector<HTMLInputElement>("#tune-name")?.value || "Evolutionary Tuning").trim(), candidateCount: Math.max(1, num("tune-candidates")), generationsRequested: Math.max(1, num("tune-generations")), searchDepth: Math.max(1, num("tune-depth")), gamesPerPairing: Math.max(1, num("tune-games")), openingSuite: (document.querySelector<HTMLTextAreaElement>("#tune-openings")?.value || DEFAULT_MIRRORED_OPENING_SUITE.join("\n")).split(/\s+/).filter(Boolean), mirroredOpeningsRequired: checked("tune-mirrored"), seedSet: seeds, candidateVsBaseline: checked("tune-baseline-matches"), candidateVsCandidate: checked("tune-peer-matches"), maxPlies: num("tune-max-plies"), noProgressPlyLimit: num("tune-no-progress"), timeLimitMs: num("tune-time-limit"), autoPauseAfterGeneration: checked("tune-auto-pause"), mutationSettings: { ...base.mutationSettings, mutationRate: Number(val("tune-rate")), mutationMagnitude: Number(val("tune-magnitude")), eliteCount: Math.max(1, num("tune-elites")), parentSelection: val("tune-parent") as any } };
+}
+function updateTuningEstimate(): void {
+  const el = document.querySelector("#tune-estimate"); if (!el || !document.querySelector("#tune-candidates")) return;
+  const s = currentTuningSettings();
+  const baseline = s.candidateVsBaseline ? s.candidateCount * s.seedSet.length * s.openingSuite.length * 2 : 0;
+  const peer = s.candidateVsCandidate ? s.candidateCount * s.seedSet.length * Math.min(2, s.openingSuite.length) * 2 : 0;
+  const perGeneration = baseline + peer;
+  el.textContent = `Estimated matches: ${perGeneration * s.generationsRequested} • games: ${perGeneration * s.generationsRequested * s.gamesPerPairing} • mirrored suite: ${s.mirroredOpeningsRequired ? "required" : "optional"} • baseline validation: ${s.candidateVsBaseline ? "enabled" : "disabled"} • storage grows after each match • browser runtime pauses when the tab or browser stops.`;
+}
+async function createTuningRunDraft(): Promise<void> {
+  const s = currentTuningSettings();
+  const matches = (s.candidateVsBaseline ? s.candidateCount * s.seedSet.length * s.openingSuite.length * 2 : 0) + (s.candidateVsCandidate ? s.candidateCount * s.seedSet.length * Math.min(2, s.openingSuite.length) * 2 : 0);
+  if (!matches) { alert("Tuning run would create zero matches."); return; }
+  await tuningStore.createTuningRun(s);
+  await renderTuningRuns();
+}
+async function runTuningAcceptance(): Promise<void> {
+  const run = await tuningStore.createTuningRun(acceptanceTuningSettings());
+  await renderTuningRuns();
+  const worker = new Worker(new URL("./tuning-worker.ts", import.meta.url), { type: "module" });
+  worker.onmessage = async (event: MessageEvent<any>) => {
+    if (event.data.type === "progress" || event.data.type === "idle" || event.data.type === "created") await renderTuningRuns(event.data.snapshot);
+    if (event.data.type === "error") document.querySelector("#tune-profile-info")!.textContent = event.data.message;
+  };
+  worker.postMessage({ type: "run", tuningRunId: run.tuningRunId });
+}
+async function renderTuningRuns(snapshot?: TuningSnapshot | null): Promise<void> {
+  const dash = document.querySelector("#tune-dashboard"); if (!dash) return;
+  const runs = await tuningStore.listTuningRuns();
+  const selected = snapshot ?? (runs[0] ? await tuningStore.loadTuningRun(runs[0].tuningRunId) : null);
+  if (!selected) { dash.innerHTML = "No tuning runs yet."; return; }
+  const r = selected.run; const best = selected.candidates.find(c => c.candidateId === r.bestCandidateId);
+  const current = selected.matches.find(m => m.matchId === r.currentMatchId);
+  const rows = selected.candidates.filter(c => c.generation === r.currentGeneration).sort((a,b)=>(a.rank??99)-(b.rank??99)||b.score-a.score).slice(0, 12);
+  dash.innerHTML = `<h3>${r.name}</h3><div class="metrics"><div><b>Status</b><span>${r.status}</span></div><div><b>Generation</b><span>${r.currentGeneration + 1} of ${r.generationsRequested}</span></div><div><b>Phase</b><span>${r.currentPhase}</span></div><div><b>Matches</b><span>${r.completedMatches}/${r.totalMatches}</span></div><div><b>Active time</b><span>${Math.round(r.activeMs/1000)}s</span></div><div><b>Current match</b><span>${current?.matchId ?? "none"}</span></div><div><b>Failed</b><span>${r.failedMatches}</span></div><div><b>Best</b><span>${best?.candidateId ?? "pending"}</span></div></div><div class="advanced-actions"><button data-tune="resume" data-id="${r.tuningRunId}">Start / Resume</button><button data-tune="pause" data-id="${r.tuningRunId}">Pause</button><button data-tune="cancel" data-id="${r.tuningRunId}">Cancel</button><button data-tune="retry" data-id="${r.tuningRunId}">Retry Failed</button><button data-tune="export" data-id="${r.tuningRunId}">Export</button><button data-tune="delete" data-id="${r.tuningRunId}">Delete</button>${best ? `<button data-tune="approve" data-id="${r.tuningRunId}" data-candidate="${best.candidateId}">Approve as experimental profile</button><button data-tune="reject" data-id="${r.tuningRunId}" data-candidate="${best.candidateId}">Reject candidate</button><button data-tune="confirm" data-id="${r.tuningRunId}" data-candidate="${best.candidateId}">Create confirmation experiment</button><button data-tune="report" data-id="${r.tuningRunId}">Export promotion report</button>` : ""}</div><table><thead><tr><th>Rank</th><th>Candidate</th><th>Score</th><th>W/L/D</th><th>Baseline</th><th>Peer</th><th>Mirror</th><th>Repetition</th><th>Line diversity</th><th>Validation</th><th>Holdout</th><th>Lineage</th><th>Mutation</th></tr></thead><tbody>${rows.map(c => `<tr><td>${c.rank ?? "-"}</td><td>${c.candidateId}</td><td>${c.score}</td><td>${c.wins}/${c.losses}/${c.draws}</td><td>${c.baselineScore}</td><td>${c.leagueScore}</td><td>${c.mirrorPenalty}</td><td>${c.repetitionPenalty}</td><td>${c.diversityPenalty}</td><td>${c.scoreBreakdown?.validationScore ?? "pending"}</td><td>${c.scoreBreakdown?.holdoutScore ?? "pending"}</td><td>${c.parentCandidateIds.join(", ") || "baseline"}</td><td>${c.mutationSummary.slice(0,2).join("; ")}</td></tr>`).join("")}</tbody></table>`;
+}
+async function tuningAction(event: Event): Promise<void> {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-tune]"); if (!button) return;
+  const id = button.dataset.id!; const action = button.dataset.tune!;
+  if (action === "resume") { const worker = new Worker(new URL("./tuning-worker.ts", import.meta.url), { type: "module" }); worker.onmessage = async (e: MessageEvent<any>) => { if (e.data.snapshot) await renderTuningRuns(e.data.snapshot); }; worker.postMessage({ type: "run", tuningRunId: id }); }
+  if (action === "pause") await tuningStore.pauseTuningRun(id);
+  if (action === "cancel") await tuningStore.cancelTuningRun(id);
+  if (action === "retry") await tuningStore.retryFailedMatches(id);
+  if (action === "delete") await tuningStore.deleteTuningRun(id);
+  try {
+    if (action === "export") {
+      const snap = await tuningStore.loadTuningRun(id);
+      if (!snap) throw new Error("Tuning run not found; nothing was exported.");
+      if (!snap.matches.length || !snap.candidates.length || !snap.profiles.length) throw new Error("Tuning run is not exportable yet because persisted profiles, candidates, or matches are missing.");
+      const files = await tuningStore.exportTuningRun(id);
+      const result = triggerDownloadZip(`${id}-tuning-export.zip`, files);
+      setDownloadFeedback(`Downloaded ${result.filename} (${result.bytes} bytes).`);
+    }
+    if (action === "approve") await tuningStore.approveCandidate(id, button.dataset.candidate!);
+    if (action === "reject") await tuningStore.rejectCandidate(id, button.dataset.candidate!);
+    if (action === "confirm") alert("Create confirmation experiment is available as an explicit manual next step; production defaults are unchanged.");
+    if (action === "report") {
+      const snap = await tuningStore.loadTuningRun(id);
+      if (!snap?.reports.length) throw new Error("No promotion report exists yet. Complete validation and holdout before exporting the report.");
+      const files = (await tuningStore.exportTuningRun(id)).filter(f => f.name === "promotion_report.md" || f.name === "promotion_report.json");
+      const result = triggerDownloadZip(`${id}-promotion-report.zip`, files);
+      setDownloadFeedback(`Downloaded ${result.filename} (${result.bytes} bytes).`);
+    }
+  } catch (err) { setDownloadFeedback(err instanceof Error ? err.message : String(err), true); }
+  await renderTuningRuns();
 }

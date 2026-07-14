@@ -5,6 +5,7 @@ import { applyMove } from "../src/game/reducer.ts";
 import { isInnerCircle } from "../src/game/terrain.ts";
 import { canonicalMoveLabel, mirrorLabel, mirrorInvariantMoveKey, mirrorState, mirrorMove, moveLabel } from "./mirror.ts";
 import type { Coord, GameState, Move, Piece, Player } from "../src/game/types.ts";
+import type { EvaluationProfile, EvaluationWeights } from "./evaluation-profiles.ts";
 
 export type AgentName =
   | "random"
@@ -26,6 +27,7 @@ export interface AgentContext {
   searchDepth?: number;
   diversity?: DiversityLevel;
   timeLimitMs?: number;
+  evaluationProfile?: EvaluationProfile;
 }
 
 export type DiversityLevel = 0 | 1 | 2 | 3;
@@ -137,6 +139,8 @@ export const EVALUATION_WEIGHTS = {
   irreversibleProgress: 180,
 } as const;
 
+function weightsFromContext(context: Pick<AgentContext, "evaluationProfile">): EvaluationWeights { return (context.evaluationProfile?.weights ?? EVALUATION_WEIGHTS) as EvaluationWeights; }
+
 const SIDE_GATES = [toCoord(GATES.west), toCoord(GATES.east)];
 const SANCTUARY_ENTRANCES = [toCoord(GATES.north), toCoord(GATES.west), toCoord(GATES.east), toCoord(GATES.south)];
 const FLAG_HOME = toCoord("G7");
@@ -195,7 +199,8 @@ function likelyExitControlled(state: GameState, defender: Player): number {
   return exits.reduce((n, gate) => n + (state.pieces.some((p) => p.player === defender && chebyshev(p, gate) <= 2) ? 1 : 0), 0);
 }
 
-function carrierContainmentScore(state: GameState, perspective: Player): number {
+function carrierContainmentScore(state: GameState, perspective: Player, weights: EvaluationWeights = EVALUATION_WEIGHTS as EvaluationWeights): number {
+  const W = weights;
   const enemy: Player = perspective === "green" ? "blue" : "green";
   const carrier = flagBearerFor(state, enemy);
   if (!carrier) return 0;
@@ -211,15 +216,15 @@ function carrierContainmentScore(state: GameState, perspective: Player): number 
   const timer = state.extractionTurnsRemaining ?? (carrying ? Math.max(0, 4 - anyGateDistance) : 0);
   let score = 0;
 
-  score += (2 - open) * EVALUATION_WEIGHTS.closedGateContainment;
-  if (inside || pickupThreat) score += EVALUATION_WEIGHTS.enemyCarrierDanger;
-  if (carrying || pickupThreat) score += EVALUATION_WEIGHTS.enemyCarrierFlagThreat;
-  if (open > 0) score -= EVALUATION_WEIGHTS.openGateEscapePenalty * open;
-  if (openDistance < 99) score += openDistance * EVALUATION_WEIGHTS.carrierExitDistance;
-  score += (4 - Math.min(4, timer)) * EVALUATION_WEIGHTS.carrierExtractionFailurePressure;
-  score += likelyExitControlled(state, perspective) * EVALUATION_WEIGHTS.controlledExit;
-  score += defendersNear * EVALUATION_WEIGHTS.routerNearCarrier;
-  if (carrying && !inside && state.extractionTurnsRemaining === null) score -= (12 - chebyshev(carrier, victorySquare(enemy))) * EVALUATION_WEIGHTS.carrierHomeApproach;
+  score += (2 - open) * W.closedGateContainment;
+  if (inside || pickupThreat) score += W.enemyCarrierDanger;
+  if (carrying || pickupThreat) score += W.enemyCarrierFlagThreat;
+  if (open > 0) score -= W.openGateEscapePenalty * open;
+  if (openDistance < 99) score += openDistance * W.carrierExitDistance;
+  score += (4 - Math.min(4, timer)) * W.carrierExtractionFailurePressure;
+  score += likelyExitControlled(state, perspective) * W.controlledExit;
+  score += defendersNear * W.routerNearCarrier;
+  if (carrying && !inside && state.extractionTurnsRemaining === null) score -= (12 - chebyshev(carrier, victorySquare(enemy))) * W.carrierHomeApproach;
   return score;
 }
 
@@ -314,8 +319,9 @@ function isImmediateReversal(previous: MoveRecord | null | undefined, move: Move
 export function evaluateState(
   state: GameState,
   player: Player,
-  context: Pick<AgentContext, "recentPositions" | "currentNoProgressPlies"> = {},
+  context: Pick<AgentContext, "recentPositions" | "currentNoProgressPlies" | "evaluationProfile"> = {},
 ): EvaluationBreakdown {
+  const W = (context.evaluationProfile?.weights ?? EVALUATION_WEIGHTS) as EvaluationWeights;
   const b: EvaluationBreakdown = {
     terminal: 0,
     material: 0,
@@ -338,86 +344,86 @@ export function evaluateState(
   };
 
   if (state.winner) {
-    b.terminal = state.winner === player ? EVALUATION_WEIGHTS.terminalWin : -EVALUATION_WEIGHTS.terminalWin;
+    b.terminal = state.winner === player ? W.terminalWin : -W.terminalWin;
   }
 
   for (const piece of state.pieces) {
-    b.material += signed(player, piece.player, materialValue(piece) * EVALUATION_WEIGHTS.materialStep);
+    b.material += signed(player, piece.player, materialValue(piece) * W.materialStep);
   }
 
   const opened = openSideGates(state);
-  if (opened.length > 0) b.gateProgress += EVALUATION_WEIGHTS.firstOpenGate;
-  if (opened.length > 1) b.gateProgress += EVALUATION_WEIGHTS.bothOpenGates;
+  if (opened.length > 0) b.gateProgress += W.firstOpenGate;
+  if (opened.length > 1) b.gateProgress += W.bothOpenGates;
 
   const cannonTargets = cannonTargetsForClosedGates(state);
   for (const engineer of state.pieces.filter((p) => p.type === "engineer")) {
     if (cannonTargets.length) {
-      const progress = (12 - minDistance(engineer, cannonTargets)) * EVALUATION_WEIGHTS.engineerCannonProgress;
+      const progress = (12 - minDistance(engineer, cannonTargets)) * W.engineerCannonProgress;
       b.gateProgress += signed(player, engineer.player, progress);
     }
     const guards = state.pieces.filter((p) => p.player === engineer.player && p.id !== engineer.id && chebyshev(p, engineer) <= 2).length;
-    b.gateProgress += signed(player, engineer.player, guards * EVALUATION_WEIGHTS.engineerProtection);
+    b.gateProgress += signed(player, engineer.player, guards * W.engineerProtection);
   }
 
   const carrier = state.flag.carrierId ? state.pieces.find((p) => p.id === state.flag.carrierId) : undefined;
   if (carrier) {
-    b.flagPossession += signed(player, carrier.player, EVALUATION_WEIGHTS.flagPickup);
+    b.flagPossession += signed(player, carrier.player, W.flagPickup);
 
     if (state.forcedGateDeparture) {
-      b.forcedDeparture += signed(player, carrier.player, EVALUATION_WEIGHTS.forcedDeparture);
+      b.forcedDeparture += signed(player, carrier.player, W.forcedDeparture);
     } else if (state.extractionTurnsRemaining !== null) {
       const exits = opened.length ? opened : SIDE_GATES;
       const d = minDistance(carrier, exits);
-      b.extractionProgress += signed(player, carrier.player, (8 - d) * EVALUATION_WEIGHTS.extractionDistance);
-      b.extractionUrgency += signed(player, carrier.player, state.extractionTurnsRemaining * EVALUATION_WEIGHTS.extractionTurn);
+      b.extractionProgress += signed(player, carrier.player, (8 - d) * W.extractionDistance);
+      b.extractionUrgency += signed(player, carrier.player, state.extractionTurnsRemaining * W.extractionTurn);
       if (d > state.extractionTurnsRemaining) {
-        b.extractionUrgency += signed(player, carrier.player, EVALUATION_WEIGHTS.extractionImpossible);
+        b.extractionUrgency += signed(player, carrier.player, W.extractionImpossible);
       }
       if (exits.some((g) => g.col === carrier.col && g.row === carrier.row)) {
-        b.extractionProgress += signed(player, carrier.player, EVALUATION_WEIGHTS.gateArrival);
+        b.extractionProgress += signed(player, carrier.player, W.gateArrival);
       }
     } else {
       const d = chebyshev(carrier, victorySquare(carrier.player));
       b.homewardCarrierProgress += signed(
         player,
         carrier.player,
-        EVALUATION_WEIGHTS.postExtraction + (12 - d) * EVALUATION_WEIGHTS.homeDistance,
+        W.postExtraction + (12 - d) * W.homeDistance,
       );
-      b.objectiveProgress += signed(player, carrier.player, (12 - d) * EVALUATION_WEIGHTS.ladenCarrierHomeStep);
+      b.objectiveProgress += signed(player, carrier.player, (12 - d) * W.ladenCarrierHomeStep);
     }
 
     const friendlyNear = state.pieces.filter((p) => p.player === carrier.player && p.id !== carrier.id && chebyshev(p, carrier) <= 2).length;
     const enemyNear = state.pieces.filter((p) => p.player !== carrier.player && chebyshev(p, carrier) <= 2).length;
-    b.carrierSafety += signed(player, carrier.player, (friendlyNear - enemyNear) * EVALUATION_WEIGHTS.carrierProtection);
-    b.objectiveProgress += signed(player, carrier.player, Math.max(0, 4 - enemyNear) * EVALUATION_WEIGHTS.carrierMobility);
-    b.objectiveProgress += signed(player, carrier.player === "green" ? "blue" : "green", enemyNear * EVALUATION_WEIGHTS.defenderRoutingPressure);
+    b.carrierSafety += signed(player, carrier.player, (friendlyNear - enemyNear) * W.carrierProtection);
+    b.objectiveProgress += signed(player, carrier.player, Math.max(0, 4 - enemyNear) * W.carrierMobility);
+    b.objectiveProgress += signed(player, carrier.player === "green" ? "blue" : "green", enemyNear * W.defenderRoutingPressure);
   } else if (opened.length > 0) {
     for (const bearer of state.pieces.filter((p) => p.type === "flagBearer")) {
       const entranceDistance = minDistance(bearer, SANCTUARY_ENTRANCES.filter((g) => opened.some((o) => o.col === g.col && o.row === g.row) || g.col === 6));
-      b.sanctuaryProgress += signed(player, bearer.player, (12 - entranceDistance) * EVALUATION_WEIGHTS.bearerEntranceProgress);
+      b.sanctuaryProgress += signed(player, bearer.player, (12 - entranceDistance) * W.bearerEntranceProgress);
       if (isInnerCircle(bearer)) {
-        b.sanctuaryProgress += signed(player, bearer.player, EVALUATION_WEIGHTS.sanctuaryEntry + (4 - chebyshev(bearer, FLAG_HOME)) * EVALUATION_WEIGHTS.insideFlagProgress);
+        b.sanctuaryProgress += signed(player, bearer.player, W.sanctuaryEntry + (4 - chebyshev(bearer, FLAG_HOME)) * W.insideFlagProgress);
       }
     }
     const flagToExit = opened.length ? Math.min(...opened.map((g) => chebyshev(FLAG_HOME, g))) : 9;
-    b.sanctuaryProgress += (9 - flagToExit) * EVALUATION_WEIGHTS.extractionRouteViability;
+    b.sanctuaryProgress += (9 - flagToExit) * W.extractionRouteViability;
   }
 
   if (state.extractionTurnsRemaining !== null && carrier && state.current === carrier.player) {
-    b.extractionUrgency += signed(player, carrier.player, EVALUATION_WEIGHTS.nonCarrierExtractionMove);
+    b.extractionUrgency += signed(player, carrier.player, W.nonCarrierExtractionMove);
   }
 
-  b.carrierContainment = carrierContainmentScore(state, player);
+  b.carrierContainment = carrierContainmentScore(state, player, W);
 
   const currentMobility = allLegalMoves(state).length;
-  b.mobility = signed(player, state.current, currentMobility * EVALUATION_WEIGHTS.mobilityStep);
+  b.mobility = signed(player, state.current, currentMobility * W.mobilityStep);
 
   const repeats = context.recentPositions?.get(positionKey(state)) ?? 0;
-  b.repetitionPenalty = repeats >= 2 ? EVALUATION_WEIGHTS.repeatedPositionSecond : repeats === 1 ? EVALUATION_WEIGHTS.repeatedPositionFirst : 0;
-  b.stagnationPenalty = Math.max(0, context.currentNoProgressPlies ?? 0) * EVALUATION_WEIGHTS.stagnationPerPly;
+  b.repetitionPenalty = repeats >= 2 ? W.repeatedPositionSecond : repeats === 1 ? W.repeatedPositionFirst : 0;
+  b.stagnationPenalty = Math.max(0, context.currentNoProgressPlies ?? 0) * W.stagnationPerPly;
 
   b.total = Object.entries(b).filter(([k]) => k !== "total").reduce((sum, [, value]) => sum + value, 0);
-  const cap = EVALUATION_WEIGHTS.terminalWin - 1;
+  const cap = W.terminalWin - 1;
   if (!state.winner) b.total = Math.max(-cap, Math.min(cap, b.total));
   return b;
 }
@@ -469,6 +475,7 @@ function evaluateMove(
   context: AgentContext,
   depth: number,
 ): ScoredMove | null {
+  const W = weightsFromContext(context);
   const next = applyMove(state, move);
   if (next === state) return null;
   const principalVariation = [move];
@@ -479,7 +486,7 @@ function evaluateMove(
   if (isImmediateReversal(context.previousMove, move, state)) score += EVALUATION_WEIGHTS.immediateReversal;
   const repeatCount = context.recentPositions?.get(positionKey(next)) ?? 0;
   if (repeatCount >= 2) score = EVALUATION_WEIGHTS.threefoldDrawScore;
-  else if (repeatCount === 1) score += EVALUATION_WEIGHTS.repeatedPositionSecond;
+  else if (repeatCount === 1) score += W.repeatedPositionSecond;
   return { move, score, breakdown, principalVariation, tie: moveTieKey(state, move, context.seed) };
 }
 
@@ -585,11 +592,12 @@ function searchValueAfterMove(
   path: string[],
   principalVariation?: Move[],
 ): number {
+  const W = weightsFromContext(context);
   if (depth === 0 || state.winner) return evaluateState(state, rootPlayer, context).total;
   const key = positionKey(state);
   const pathRepeats = path.filter((k) => k === key).length;
   if (pathRepeats >= 2) return EVALUATION_WEIGHTS.threefoldDrawScore;
-  if (pathRepeats > 0) return evaluateState(state, rootPlayer, context).total + EVALUATION_WEIGHTS.repeatedPositionSecond;
+  if (pathRepeats > 0) return evaluateState(state, rootPlayer, context).total + W.repeatedPositionSecond;
   const moves = staticRankedMoves(state, allLegalMoves(state), state.current, context, 12);
   if (!moves.length) return evaluateState(state, rootPlayer, context).total;
   const opponent = state.current !== rootPlayer;
@@ -638,13 +646,14 @@ function orderedAlphaBetaMoves(state: GameState, moves: Move[], root: Player, co
 }
 
 function alphaBetaValue(state: GameState, depth: number, root: Player, context: AgentContext, ab: AlphaBetaState, alpha: number, beta: number, path: string[]): { score: number; pv: Move[] } | null {
+  const W = weightsFromContext(context);
   if (checkTimeout(ab)) return null;
   ab.diagnostics.nodesSearched++;
   const pkey = positionKey(state);
   const pathRepeats = path.filter((k) => k === pkey).length;
   if (depth === 0 || state.winner || pathRepeats > 0) {
     ab.diagnostics.leafEvaluations++;
-    const repeat = pathRepeats >= 2 ? EVALUATION_WEIGHTS.threefoldDrawScore - evaluateState(state, root, context).total : pathRepeats ? EVALUATION_WEIGHTS.repeatedPositionSecond : 0;
+    const repeat = pathRepeats >= 2 ? EVALUATION_WEIGHTS.threefoldDrawScore - evaluateState(state, root, context).total : pathRepeats ? W.repeatedPositionSecond : 0;
     return { score: evaluateState(state, root, context).total + repeat, pv: [] };
   }
   const originalAlpha = alpha, originalBeta = beta;
@@ -802,12 +811,13 @@ export interface SearchBenchmarkResult {
 }
 
 function countedFullSearchValue(state: GameState, depth: number, rootPlayer: Player, context: AgentContext, path: string[], counts: { nodes: number; leaves: number }, principalVariation?: Move[]): number {
+  const W = weightsFromContext(context);
   counts.nodes++;
   if (depth === 0 || state.winner) { counts.leaves++; return evaluateState(state, rootPlayer, context).total; }
   const key = positionKey(state);
   const pathRepeats = path.filter((k) => k === key).length;
   if (pathRepeats >= 2) { counts.leaves++; return EVALUATION_WEIGHTS.threefoldDrawScore; }
-  if (pathRepeats > 0) { counts.leaves++; return evaluateState(state, rootPlayer, context).total + EVALUATION_WEIGHTS.repeatedPositionSecond; }
+  if (pathRepeats > 0) { counts.leaves++; return evaluateState(state, rootPlayer, context).total + W.repeatedPositionSecond; }
   const moves = staticRankedMoves(state, allLegalMoves(state), state.current, context, 12);
   if (!moves.length) { counts.leaves++; return evaluateState(state, rootPlayer, context).total; }
   const opponent = state.current !== rootPlayer;
