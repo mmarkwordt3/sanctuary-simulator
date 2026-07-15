@@ -2,7 +2,7 @@ import { fromCoord } from "../../src/game/coords.ts";
 import { createInitialState } from "../../src/game/setup.ts";
 import type { Move } from "../../src/game/types.ts";
 import { legalMovesForState, describeMove } from "../../simulator/agents.ts";
-import { productionEvaluationProfile, validateEvaluationProfile, type EvaluationProfile } from "../../simulator/evaluation-profiles.ts";
+import { PRODUCTION_PROFILE_ID, productionEvaluationProfile, validateEvaluationProfile, type EvaluationProfile } from "../../simulator/evaluation-profiles.ts";
 import {
   acceptanceTuningSettings,
   generateCandidates,
@@ -44,6 +44,9 @@ export interface TuningRunRecord extends TuningRunSettings {
 }
 
 export interface TuningSnapshot { run: TuningRunRecord; profiles: EvaluationProfile[]; candidates: TuningCandidate[]; matches: TuningMatch[]; generations: TuningGeneration[]; reports: PromotionReport[]; }
+
+export interface ApprovedExperimentalProfileMetadata { sourceTuningRunId: string; sourceCandidateId: string; approvedAt: string; parentOrBaselineProfileId: string; evaluationWeights: EvaluationProfile["weights"]; status: "approved-experimental"; }
+export type ApprovedEvaluationProfile = EvaluationProfile & { experimentalApproval: ApprovedExperimentalProfileMetadata };
 
 const STORES = ["evaluationProfiles", "tuningRuns", "tuningCandidates", "tuningMatches", "tuningGenerations", "promotionReports"];
 function now() { return new Date().toISOString(); }
@@ -100,12 +103,13 @@ export class TuningStore {
     if (!settings.candidateVsBaseline && !settings.candidateVsCandidate) throw new Error("Tuning run would create zero matches.");
     const createdAt = now();
     const tuningRunId = id("tune");
-    const baseline = productionEvaluationProfile(createdAt);
-    const { profiles, candidates } = generateCandidates(tuningRunId, baseline, settings, 0);
-    const matches = scheduleGenerationMatches(tuningRunId, 0, candidates, settings).map((m) => ({ ...m, fixture: "training" as const }));
+    const baseline = await this.resolveBaselineProfile(settings.baselineProfileId, createdAt);
+    const settingsWithBaseline = { ...settings, baselineProfileId: baseline.profileId };
+    const { profiles, candidates } = generateCandidates(tuningRunId, baseline, settingsWithBaseline, 0);
+    const matches = scheduleGenerationMatches(tuningRunId, 0, candidates, settingsWithBaseline).map((m) => ({ ...m, fixture: "training" as const }));
     if (!matches.length) throw new Error("Tuning run would create zero matches.");
     const generation: TuningGeneration & { generationKey: string } = { generationKey: generationKey(tuningRunId, 0), tuningRunId, generation: 0, status: "queued", candidateIds: candidates.map((c) => c.candidateId), matchIds: matches.map((m) => m.matchId), championCandidateId: null, summary: {}, createdAt, updatedAt: createdAt };
-    const run: TuningRunRecord = { ...settings, tuningRunId, createdAt, updatedAt: createdAt, status: "queued", currentGeneration: 0, currentPhase: "training", totalMatches: matches.length, completedMatches: 0, failedMatches: 0, bestCandidateId: null, currentWorkerState: "idle", currentMatchId: null, activeStartedAt: null, activeMs: 0, schemaVersion: EXPERIMENT_SCHEMA_VERSION, tunerVersion: TUNER_VERSION };
+    const run: TuningRunRecord = { ...settingsWithBaseline, tuningRunId, createdAt, updatedAt: createdAt, status: "queued", currentGeneration: 0, currentPhase: "training", totalMatches: matches.length, completedMatches: 0, failedMatches: 0, bestCandidateId: null, currentWorkerState: "idle", currentMatchId: null, activeStartedAt: null, activeMs: 0, schemaVersion: EXPERIMENT_SCHEMA_VERSION, tunerVersion: TUNER_VERSION };
     const db = await this.db();
     await txDone(db.transaction(STORES, "readwrite"), (tx) => {
       tx.objectStore("evaluationProfiles").put(baseline);
@@ -116,6 +120,19 @@ export class TuningStore {
       tx.objectStore("tuningGenerations").put(generation);
     });
     return run;
+  }
+
+  async listApprovedExperimentalProfiles(): Promise<ApprovedEvaluationProfile[]> {
+    const profiles = await getAll<EvaluationProfile & { experimentalApproval?: ApprovedExperimentalProfileMetadata }>(await this.db(), "evaluationProfiles");
+    return profiles.filter((p): p is ApprovedEvaluationProfile => p.source === "promotion" && p.promoted === true && p.experimentalApproval?.status === "approved-experimental").sort((a, b) => b.experimentalApproval.approvedAt.localeCompare(a.experimentalApproval.approvedAt));
+  }
+  async getProfile(profileId: string) { return get<EvaluationProfile>(await this.db(), "evaluationProfiles", profileId); }
+  private async resolveBaselineProfile(profileId: string, stamp = now()): Promise<EvaluationProfile> {
+    if (!profileId || profileId === PRODUCTION_PROFILE_ID) return productionEvaluationProfile(stamp);
+    const profile = await this.getProfile(profileId);
+    if (!profile) throw new Error(`Selected baseline profile ${profileId} was not found. Choose an available baseline profile.`);
+    if (!(profile.source === "promotion" && profile.promoted)) throw new Error(`Selected baseline profile ${profileId} is not an approved experimental profile.`);
+    return profile;
   }
 
   async listTuningRuns() { return (await getAll<TuningRunRecord>(await this.db(), "tuningRuns")).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
@@ -170,7 +187,7 @@ export class TuningStore {
       for (const m of snap.matches) tx.objectStore("tuningMatches").delete(m.matchId);
       for (const g of snap.generations as Array<TuningGeneration & { generationKey: string }>) tx.objectStore("tuningGenerations").delete(g.generationKey ?? generationKey(g.tuningRunId, g.generation));
       for (const r of snap.reports) tx.objectStore("promotionReports").delete(r.reportId);
-      for (const p of snap.profiles.filter((p) => p.source !== "promotion" && p.profileId !== snap.run.baselineProfileId)) tx.objectStore("evaluationProfiles").delete(p.profileId);
+      for (const p of snap.profiles.filter((p) => p.source !== "promotion" && p.profileId !== snap.run.baselineProfileId && p.profileId !== PRODUCTION_PROFILE_ID)) tx.objectStore("evaluationProfiles").delete(p.profileId);
     });
   }
   async exportTuningRun(tuningRunId: string): Promise<ExportFile[]> { const snap = await this.loadTuningRun(tuningRunId); if (!snap) throw new Error("Tuning run not found"); return tuningExportFiles(snap.run, snap.profiles, snap.candidates, snap.matches, snap.generations, snap.reports[0] ?? null) as ExportFile[]; }
@@ -178,7 +195,9 @@ export class TuningStore {
     const snap = await this.loadTuningRun(tuningRunId); if (!snap) throw new Error("Tuning run not found");
     const candidate = snap.candidates.find((c) => c.candidateId === candidateId); if (!candidate) throw new Error("Candidate not found");
     const sourceProfile = snap.profiles.find((p) => p.profileId === candidate.profileId); if (!sourceProfile) throw new Error("Profile not found");
-    const stamp = now(); const promoted = validateEvaluationProfile({ ...sourceProfile, profileId: `approved-${candidate.profileId}-${Date.now().toString(36)}`, name: `${sourceProfile.name} approved experimental`, source: "promotion", parentProfileIds: [sourceProfile.profileId], promoted: true, createdAt: stamp, updatedAt: stamp, notes: `${sourceProfile.notes}\nApproved from ${tuningRunId} at ${stamp}.` });
+    const existing = (await this.listApprovedExperimentalProfiles()).find((p) => p.experimentalApproval.sourceTuningRunId === tuningRunId && p.experimentalApproval.sourceCandidateId === candidateId);
+    if (existing) return existing;
+    const stamp = now(); const promoted = validateEvaluationProfile({ ...sourceProfile, profileId: `approved-${candidate.profileId}-${Date.now().toString(36)}`, name: `${sourceProfile.name} approved experimental`, source: "promotion", parentProfileIds: [snap.run.baselineProfileId, sourceProfile.profileId], promoted: true, createdAt: stamp, updatedAt: stamp, notes: `${sourceProfile.notes}\nApproved from ${tuningRunId} candidate ${candidateId} at ${stamp}.`, experimentalApproval: { sourceTuningRunId: tuningRunId, sourceCandidateId: candidateId, approvedAt: stamp, parentOrBaselineProfileId: snap.run.baselineProfileId, evaluationWeights: sourceProfile.weights, status: "approved-experimental" } } as EvaluationProfile & { experimentalApproval: ApprovedExperimentalProfileMetadata }) as ApprovedEvaluationProfile;
     const report = snap.reports.find((r) => r.candidateId === candidateId) ?? promotionEligibility(candidate, snap.matches);
     const db = await this.db();
     await txDone(db.transaction(["evaluationProfiles", "tuningCandidates", "promotionReports"], "readwrite"), (tx) => {
@@ -223,7 +242,7 @@ export class TuningStore {
       tx.objectStore("tuningMatches").put(updatedMatch);
       if (generationDone && match.fixture === "training") {
         const currentGenCandidates = candidates.filter((c) => c.generation === match.generation && c.tuningRunId === tuningRunId);
-        const ranked = scoreCandidates(currentGenCandidates, generationMatches);
+        const ranked = scoreCandidates(currentGenCandidates, generationMatches, run.scoringSettings, run.baselineProfileId);
         for (const c of ranked) tx.objectStore("tuningCandidates").put(c);
         candidates = candidates.map((c) => ranked.find((r) => r.candidateId === c.candidateId) ?? c);
         const champion = ranked[0] ?? null;
@@ -263,7 +282,7 @@ export class TuningStore {
         if (holdoutDone) {
           const finalGeneration = Math.max(...candidates.map((c) => c.generation));
           const finalCandidates = candidates.filter((c) => c.generation === finalGeneration);
-          const scoredFinalists = scoreCandidates(finalCandidates, matches.filter((m) => m.fixture !== "holdout"));
+          const scoredFinalists = scoreCandidates(finalCandidates, matches.filter((m) => m.fixture !== "holdout"), run.scoringSettings, run.baselineProfileId);
           const withFinalPhaseScores = scoredFinalists.map((candidate) => {
             const related = matches.filter((m) => m.greenProfileId === candidate.profileId || m.blueProfileId === candidate.profileId);
             const phaseScore = (fixture: "validation" | "holdout") => related.filter((m) => m.fixture === fixture).reduce((sum, m) => sum + (m.result === "draw" ? 0 : (m.greenProfileId === candidate.profileId && m.result === "green") || (m.blueProfileId === candidate.profileId && m.result === "blue") ? 1 : -1), 0);
