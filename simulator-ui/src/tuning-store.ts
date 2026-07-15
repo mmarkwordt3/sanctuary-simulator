@@ -5,6 +5,7 @@ import { legalMovesForState, describeMove } from "../../simulator/agents.ts";
 import { PRODUCTION_PROFILE_ID, productionEvaluationProfile, validateEvaluationProfile, type EvaluationProfile } from "../../simulator/evaluation-profiles.ts";
 import {
   acceptanceTuningSettings,
+  buildPromotionReport,
   generateCandidates,
   promotionEligibility,
   scheduleGenerationMatches,
@@ -34,6 +35,13 @@ export interface TuningRunRecord extends TuningRunSettings {
   completedMatches: number;
   failedMatches: number;
   bestCandidateId: string | null;
+  overallChampionCandidateId: string | null;
+  overallChampionProfileId: string | null;
+  overallChampionGeneration: number | null;
+  overallChampionIsSelectedBaseline: boolean;
+  finalGenerationBestCandidateId: string | null;
+  selectedBaselineProfileId: string | null;
+  promotionCandidateId: string | null;
   currentWorkerState: "idle" | "running" | "interrupted";
   currentMatchId: string | null;
   activeStartedAt: string | null;
@@ -109,7 +117,7 @@ export class TuningStore {
     const matches = scheduleGenerationMatches(tuningRunId, 0, candidates, settingsWithBaseline).map((m) => ({ ...m, fixture: "training" as const }));
     if (!matches.length) throw new Error("Tuning run would create zero matches.");
     const generation: TuningGeneration & { generationKey: string } = { generationKey: generationKey(tuningRunId, 0), tuningRunId, generation: 0, status: "queued", candidateIds: candidates.map((c) => c.candidateId), matchIds: matches.map((m) => m.matchId), championCandidateId: null, summary: {}, createdAt, updatedAt: createdAt };
-    const run: TuningRunRecord = { ...settingsWithBaseline, tuningRunId, createdAt, updatedAt: createdAt, status: "queued", currentGeneration: 0, currentPhase: "training", totalMatches: matches.length, completedMatches: 0, failedMatches: 0, bestCandidateId: null, currentWorkerState: "idle", currentMatchId: null, activeStartedAt: null, activeMs: 0, schemaVersion: EXPERIMENT_SCHEMA_VERSION, tunerVersion: TUNER_VERSION };
+    const run: TuningRunRecord = { ...settingsWithBaseline, tuningRunId, createdAt, updatedAt: createdAt, status: "queued", currentGeneration: 0, currentPhase: "training", totalMatches: matches.length, completedMatches: 0, failedMatches: 0, bestCandidateId: null, overallChampionCandidateId: null, overallChampionProfileId: null, overallChampionGeneration: null, overallChampionIsSelectedBaseline: false, finalGenerationBestCandidateId: null, selectedBaselineProfileId: baseline.profileId, promotionCandidateId: null, currentWorkerState: "idle", currentMatchId: null, activeStartedAt: null, activeMs: 0, schemaVersion: EXPERIMENT_SCHEMA_VERSION, tunerVersion: TUNER_VERSION };
     const db = await this.db();
     await txDone(db.transaction(STORES, "readwrite"), (tx) => {
       tx.objectStore("evaluationProfiles").put(baseline);
@@ -290,8 +298,8 @@ export class TuningStore {
           });
           for (const c of withFinalPhaseScores) tx.objectStore("tuningCandidates").put(c);
           candidates = candidates.map((c) => withFinalPhaseScores.find((s) => s.candidateId === c.candidateId) ?? c);
-          const best = withFinalPhaseScores[0] ?? finalCandidates.sort((a, b) => b.score - a.score || a.candidateId.localeCompare(b.candidateId))[0];
-          if (best) { const report = promotionEligibility(best, matches); tx.objectStore("promotionReports").put(report); run.bestCandidateId = best.candidateId; }
+          const report = buildPromotionReport(run, candidates, matches);
+          if (report) { tx.objectStore("promotionReports").put(report); run.bestCandidateId = report.overallChampionCandidateId ?? null; run.overallChampionCandidateId = report.overallChampionCandidateId ?? null; run.overallChampionProfileId = report.overallChampionProfileId ?? null; run.overallChampionGeneration = report.overallChampionGeneration ?? null; run.overallChampionIsSelectedBaseline = !!report.overallChampionIsSelectedBaseline; run.finalGenerationBestCandidateId = report.finalGenerationBestCandidateId ?? null; run.selectedBaselineProfileId = report.selectedBaselineProfileId ?? run.baselineProfileId; run.promotionCandidateId = report.promotionCandidateId ?? null; }
           run.status = "completed"; run.currentPhase = "complete"; run.completedAt = completedAt;
         }
       }
