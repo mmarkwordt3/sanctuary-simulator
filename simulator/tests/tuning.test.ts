@@ -137,3 +137,39 @@ describe("promotion recommendation evidence thresholds", () => {
     expect(promotionEligibility(promotable(), phaseRows("p", ["win"], [])).recommendation).not.toBe("eligible for manual promotion");
   });
 });
+
+describe("canonical final champion selection", () => {
+  function runSettings() { const s = acceptanceTuningSettings(); s.baselineProfileId = "approved-baseline"; s.antiOverfitSettings.minSampleSize = 2; return s; }
+  function c(id: string, profileId: string, generation: number, score: number, baselineScore = 0) { return { ...candidate(id, profileId), generation, score, baselineScore, tuningRunId: "run" }; }
+  function evidence(profileId: string, validation: Array<"win"|"loss"|"draw">, holdout: Array<"win"|"loss"|"draw">) {
+    const toResult = (outcome: "win"|"loss"|"draw") => outcome === "win" ? "green" : outcome === "loss" ? "blue" : "draw";
+    return [...validation.map((outcome, i) => match(profileId, toResult(outcome), { matchId: `cv-${profileId}-${i}`, fixture: "validation", candidateBProfileId: "approved-baseline", blueProfileId: "approved-baseline" })), ...holdout.map((outcome, i) => match(profileId, toResult(outcome), { matchId: `ch-${profileId}-${i}`, fixture: "holdout", candidateBProfileId: "approved-baseline", blueProfileId: "approved-baseline" }))];
+  }
+
+  it("keeps the selected experimental baseline when final generation is lower, tied, or neutral", async () => {
+    const { buildPromotionReport, tuningExportFiles } = await import("../tuning.ts");
+    for (const [score, validation, holdout] of [[9, ["win"], ["win"]], [10, ["win"], ["win"]], [12, ["draw"], ["draw"]]] as const) {
+      const candidates = [c("g0-c0", "approved-baseline", 0, 10), c("g1-c0", "mutated", 1, score, 1)];
+      const report = buildPromotionReport(runSettings(), candidates, evidence("mutated", [...validation], [...holdout]))!;
+      expect(report.overallChampionCandidateId).toBe("g0-c0");
+      expect(report.finalGenerationBestCandidateId).toBe("g1-c0");
+      expect(report.overallChampionIsSelectedBaseline).toBe(true);
+      expect(["no improvement found", "continue testing"]).toContain(report.recommendation);
+      const files = tuningExportFiles({ ...runSettings(), tuningRunId: "run" }, [], candidates, evidence("mutated", [...validation], [...holdout]), [], report);
+      const json = JSON.parse(files.find(f => f.name === "promotion_report.json")!.content);
+      const md = files.find(f => f.name === "promotion_report.md")!.content;
+      expect(md).toContain(json.overallChampionCandidateId);
+      expect(md).toContain(json.finalGenerationBestCandidateId);
+      expect(md).toContain(json.selectedBaselineProfileId);
+    }
+  });
+
+  it("promotes only when final generation exceeds baseline with positive validation and holdout", async () => {
+    const { buildPromotionReport } = await import("../tuning.ts");
+    const candidates = [c("g0-c0", "approved-baseline", 0, 10), c("g1-c0", "mutated", 1, 12, 1)];
+    const report = buildPromotionReport(runSettings(), candidates, evidence("mutated", ["win"], ["win"]))!;
+    expect(report.overallChampionCandidateId).toBe("g1-c0");
+    expect(report.promotionCandidateId).toBe("g1-c0");
+    expect(report.recommendation).toBe("eligible for manual promotion");
+  });
+});
