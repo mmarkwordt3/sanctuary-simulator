@@ -93,4 +93,58 @@ describe("persistent evolutionary tuning lifecycle", () => {
     const snap = (await store.loadTuningRun(run.tuningRunId))!;
     expect(snap.candidates.find(c => c.candidateId === first.candidateId)!.eliminated).toBe(true);
   });
+
+  it("prevents duplicate approvals, persists approved profiles independently, and uses selected experimental baselines", async () => {
+    const name = dbName();
+    let store = new TuningStore(name);
+    const run = await store.createTuningRun(quickSettings());
+    const firstSnap = (await store.loadTuningRun(run.tuningRunId))!;
+    const sourceCandidate = firstSnap.candidates[1];
+    const sourceProfile = firstSnap.profiles.find(p => p.profileId === sourceCandidate.profileId)!;
+
+    const approved = await store.approveCandidate(run.tuningRunId, sourceCandidate.candidateId);
+    const duplicate = await store.approveCandidate(run.tuningRunId, sourceCandidate.candidateId);
+    expect(duplicate.profileId).toBe(approved.profileId);
+    expect((await store.listApprovedExperimentalProfiles()).filter(p => p.experimentalApproval.sourceCandidateId === sourceCandidate.candidateId)).toHaveLength(1);
+    expect(approved.experimentalApproval.sourceTuningRunId).toBe(run.tuningRunId);
+    expect(approved.experimentalApproval.parentOrBaselineProfileId).toBe(run.baselineProfileId);
+    expect(approved.experimentalApproval.evaluationWeights).toEqual(sourceProfile.weights);
+
+    store.close();
+    store = new TuningStore(name);
+    expect((await store.listApprovedExperimentalProfiles()).map(p => p.profileId)).toContain(approved.profileId);
+
+    await store.deleteTuningRun(run.tuningRunId);
+    expect(await store.loadTuningRun(run.tuningRunId)).toBeNull();
+    expect((await store.listApprovedExperimentalProfiles()).map(p => p.profileId)).toContain(approved.profileId);
+
+    const experimentalSettings = quickSettings();
+    experimentalSettings.baselineProfileId = approved.profileId;
+    const confirmation = await store.createTuningRun(experimentalSettings);
+    const confirmationSnap = (await store.loadTuningRun(confirmation.tuningRunId))!;
+    expect(confirmationSnap.run.baselineProfileId).toBe(approved.profileId);
+    expect(confirmationSnap.profiles.find(p => p.profileId === approved.profileId)?.weights).toEqual(approved.weights);
+    expect(confirmationSnap.candidates[0].profileId).toBe(approved.profileId);
+    expect(confirmationSnap.matches.some(m => m.greenProfileId === approved.profileId || m.blueProfileId === approved.profileId)).toBe(true);
+    expect((await store.getProfile("production-baseline-v1"))!.source).toBe("production");
+
+    const files = await store.exportTuningRun(confirmation.tuningRunId);
+    expect(files.find(f => f.name === "tuning_run_metadata.json")!.content).toContain(approved.profileId);
+    expect(files.find(f => f.name === "tuner_config.json")!.content).toContain("selectedBaselineProfileId");
+    expect(files.find(f => f.name === "promotion_report.md")!.content).toContain("No candidate is automatically promoted");
+  });
+
+  it("rejects missing or unapproved selected baseline profile ids", async () => {
+    const store = new TuningStore(dbName());
+    const missing = quickSettings();
+    missing.baselineProfileId = "missing-experimental-profile";
+    await expect(store.createTuningRun(missing)).rejects.toThrow("Selected baseline profile missing-experimental-profile was not found");
+
+    const run = await store.createTuningRun(quickSettings());
+    const candidateProfileId = (await store.loadTuningRun(run.tuningRunId))!.candidates[1].profileId;
+    const unapproved = quickSettings();
+    unapproved.baselineProfileId = candidateProfileId;
+    await expect(store.createTuningRun(unapproved)).rejects.toThrow("is not an approved experimental profile");
+  });
+
 });
