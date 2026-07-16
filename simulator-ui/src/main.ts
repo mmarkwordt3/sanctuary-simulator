@@ -16,6 +16,7 @@ const experimentStore = new ExperimentStore();
 const tuningStore = new TuningStore();
 let activeExperimentRun: { experimentId: string; pauseRequested: boolean; cancelRequested: boolean; running: boolean; worker: Worker | null } | null = null;
 let activeQueueRun: { worker: Worker | null; running: boolean; cancelRequested: boolean } | null = null;
+let queueInitialized = false;
 let currentExperimentView: { experimentId: string; page: number; pageSize: number; query: GameQuery; replayTimer: number | null; replayPly: number } | null = null;
 const state: { settings: SimulatorUiSettings; worker: Worker | null; result: RunResult | null; startedAt: number; paused: boolean } = {
   settings: structuredClone(DEFAULT_SETTINGS),
@@ -46,7 +47,7 @@ J3-J4
 E1-F1
 I1-H1</textarea></label><p id="tune-estimate"></p><button id="tune-create">Create tuning run</button><button id="tune-acceptance">Run real acceptance scenario</button><div id="tune-dashboard"></div><div id="tune-profile-info"></div></section>
 
-    <section class="card"><h2>10. Phase 4 / Tuning Queue</h2><p class="warning">Automated queue runs one tuning match at a time while this browser tab remains open and awake. It survives reloads, recovers running tuning runs, and never auto-promotes candidates; eligible candidates are marked Manual review required.</p><div class="grid"><label>Queue preset<select id="queue-preset"><option>Small validation</option><option>Broad search</option><option>Confirmation</option></select></label><label>Queue run name<input id="queue-name" value="Small validation"></label></div><p class="warning">Choose/edit baseline and tuning settings in the Evolutionary Tuning panel above, or load a preset here before adding it to the queue.</p><div class="advanced-actions"><button id="queue-load-preset">Load preset into editor</button><button id="queue-add">Add edited job to queue</button><button id="queue-start">Start queue</button><button id="queue-pause-match">Pause after current match</button><button id="queue-pause-run">Pause after current run</button><button id="queue-resume">Resume queue</button></div><div id="queue-dashboard">Loading queue…</div></section>
+    <section class="card"><h2>10. Phase 4 / Tuning Queue</h2><p class="warning">Automated queue runs one tuning match at a time while this browser tab remains open and awake. It survives reloads, recovers running tuning runs, and never auto-promotes candidates; eligible candidates are marked Manual review required.</p><div class="grid"><label>Queue preset<select id="queue-preset"><option>Small validation</option><option>Broad search</option><option>Confirmation</option></select></label><label>Queue run name<input id="queue-name" value="Small validation"></label></div><p class="warning">Choose/edit baseline and tuning settings in the Evolutionary Tuning panel above, or load a preset here before adding it to the queue.</p><div class="advanced-actions"><button id="queue-load-preset" disabled>Load preset into editor</button><button id="queue-add" disabled>Add edited job to queue</button><button id="queue-start" disabled>Start queue</button><button id="queue-pause-match" disabled>Pause after current match</button><button id="queue-pause-run" disabled>Pause after current run</button><button id="queue-resume" disabled>Resume queue</button></div><div id="queue-dashboard">Loading queue…</div></section>
     <section class="card"><h2>11. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
   </div><aside class="run-panel" aria-label="Run controls"><h2>Run Simulation</h2><button id="start">Start</button><button id="pause" disabled>Pause</button><button id="resume" disabled>Resume</button><button id="cancel" disabled>Cancel</button><button id="reset">Reset</button><div class="mini-progress"><progress id="sticky-bar" value="0" max="100"></progress><div id="sticky-progress-text">No run started.</div></div></aside></main>`;
 
@@ -54,7 +55,33 @@ renderForms();
 wireEvents();
 updateApplicability();
 experimentStore.pauseRecovery().then(renderExperiments).catch(console.error);
-tuningStore.recoverQueueAfterReload().then(async (qs) => { await refreshBaselineDropdown(); await renderTuningRuns(); await renderQueue(); if (qs.autoRunEnabled) void startQueueRunner(); }).catch(console.error);
+initializeTuningQueueUi();
+
+async function initializeTuningQueueUi(): Promise<void> {
+  setQueueControlsEnabled(false);
+  try {
+    const qs = await tuningStore.recoverQueueAfterReload();
+    try { await refreshBaselineDropdown(); } catch (err) { setDownloadFeedback(`Profile/baseline load failed: ${err instanceof Error ? err.message : String(err)}`, true); }
+    await renderTuningRuns().catch((err) => setDownloadFeedback(`Tuning run render failed: ${err instanceof Error ? err.message : String(err)}`, true));
+    queueInitialized = true;
+    setQueueControlsEnabled(true);
+    await renderQueue(`Recovery completed. ${qs.message ?? "Queue loaded."}`);
+    if (qs.autoRunEnabled) void startQueueRunner();
+  } catch (err) {
+    queueInitialized = false;
+    setQueueControlsEnabled(false);
+    const message = err instanceof Error ? err.message : String(err);
+    document.querySelector("#queue-dashboard")!.innerHTML = `<p class="warning">Queue load failed: ${message}</p>`;
+    setDownloadFeedback(`Queue load failed: ${message}`, true);
+  }
+}
+
+function setQueueControlsEnabled(enabled: boolean): void {
+  for (const id of ["queue-load-preset", "queue-add", "queue-start", "queue-pause-match", "queue-pause-run", "queue-resume"]) {
+    const button = document.querySelector<HTMLButtonElement>(`#${id}`);
+    if (button) button.disabled = !enabled;
+  }
+}
 
 function renderForms(): void {
   document.querySelector("#standard-fields")!.innerHTML = [
@@ -437,7 +464,9 @@ function summarizeStoredGames(games: Array<{ plies: number; finalReplayOk: boole
 async function refreshBaselineDropdown(selectProfileId?: string): Promise<void> {
   const select = document.querySelector<HTMLSelectElement>("#tune-baseline"); if (!select) return;
   const current = selectProfileId ?? (select.value || "production-baseline-v1");
-  const approved = await tuningStore.listApprovedExperimentalProfiles();
+  let approved = [];
+  try { approved = await tuningStore.listApprovedExperimentalProfiles(); }
+  catch (err) { setDownloadFeedback(`Profile/baseline load failed: ${err instanceof Error ? err.message : String(err)}`, true); throw err; }
   select.innerHTML = `<option value="production-baseline-v1">Production baseline (production-baseline-v1)</option>` + approved.map((p) => {
     const approvedAt = new Date(p.experimentalApproval.approvedAt).toLocaleString();
     return `<option value="${p.profileId}">${p.name} (${p.profileId}) — from ${p.experimentalApproval.sourceTuningRunId}, approved ${approvedAt}</option>`;
@@ -536,12 +565,15 @@ function applyTuningSettingsToEditor(s: ReturnType<typeof currentTuningSettings>
   (document.querySelector<HTMLInputElement>("#tune-max-plies")!).value = String(s.maxPlies);
   (document.querySelector<HTMLInputElement>("#tune-no-progress")!).value = String(s.noProgressPlyLimit);
   (document.querySelector<HTMLTextAreaElement>("#tune-openings")!).value = s.openingSuite.join("\n");
-  (document.querySelector<HTMLInputElement>("#tune-auto-pause")!).checked = false;
+  (document.querySelector<HTMLInputElement>("#tune-auto-pause")!).checked = s.autoPauseAfterGeneration;
+  (document.querySelector<HTMLInputElement>("#tune-mirrored")!).checked = s.mirroredOpeningsRequired;
+  (document.querySelector<HTMLInputElement>("#tune-baseline-matches")!).checked = s.candidateVsBaseline;
+  (document.querySelector<HTMLInputElement>("#tune-peer-matches")!).checked = s.candidateVsCandidate;
   updateTuningEstimate();
 }
 function queuePresetName(): "Small validation"|"Broad search"|"Confirmation" { return (document.querySelector<HTMLSelectElement>("#queue-preset")?.value ?? "Small validation") as any; }
-function loadQueuePreset(): void { const name = queuePresetName(); const baseline = val("tune-baseline") || "production-baseline-v1"; const settings = tuningQueuePreset(name, baseline); applyTuningSettingsToEditor(settings); (document.querySelector<HTMLInputElement>("#queue-name")!).value = name; setDownloadFeedback(`Loaded queue preset ${name} for editing.`); }
-async function addQueueJob(): Promise<void> { const settings = currentTuningSettings(); const runName = (document.querySelector<HTMLInputElement>("#queue-name")?.value || settings.name).trim(); await tuningStore.enqueueTuningJob(runName, settings.baselineProfileId, { ...settings, name: runName, autoPauseAfterGeneration: false }); setDownloadFeedback(`Queued tuning job ${runName}.`); await renderQueue(); }
+function loadQueuePreset(): void { try { const name = queuePresetName(); const baseline = val("tune-baseline") || "production-baseline-v1"; const settings = tuningQueuePreset(name, baseline); applyTuningSettingsToEditor(settings); (document.querySelector<HTMLInputElement>("#queue-name")!).value = name; setDownloadFeedback(`Preset loaded into editor: ${name}.`); } catch (err) { setDownloadFeedback(`Preset load failed: ${err instanceof Error ? err.message : String(err)}`, true); } }
+async function addQueueJob(): Promise<void> { if (!queueInitialized) { setDownloadFeedback("Job add failed: queue is still loading.", true); return; } try { const settings = currentTuningSettings(); const runName = (document.querySelector<HTMLInputElement>("#queue-name")?.value || settings.name).trim(); const item = await tuningStore.enqueueTuningJob(runName, settings.baselineProfileId, { ...settings, name: runName, autoPauseAfterGeneration: false }); await renderQueue(`Job added: ${runName} (${item.queueItemId}).`); setDownloadFeedback(`Job added: ${runName} (${item.queueItemId}).`); } catch (err) { setDownloadFeedback(`Job add failed: ${err instanceof Error ? err.message : String(err)}`, true); await renderQueue(`Job add failed: ${err instanceof Error ? err.message : String(err)}`); } }
 async function startQueueRunner(): Promise<void> { if (activeQueueRun?.running) return; await tuningStore.resumeQueue(); activeQueueRun = { worker: null, running: true, cancelRequested: false }; await renderQueue(); void runQueueLoop(); }
 async function runQueueLoop(): Promise<void> {
   while (activeQueueRun?.running) {
@@ -561,7 +593,7 @@ async function runQueueLoop(): Promise<void> {
   activeQueueRun?.worker?.terminate(); activeQueueRun = null; await renderQueue(); await renderTuningRuns();
 }
 function runQueuedWorker(queueItemId: string, tuningRunId: string): Promise<void> { return new Promise((resolve) => { const worker = new Worker(new URL("./tuning-worker.ts", import.meta.url), { type: "module" }); if (activeQueueRun) activeQueueRun.worker = worker; worker.onmessage = async (e: MessageEvent<any>) => { if (e.data.snapshot) await renderTuningRuns(e.data.snapshot); const qs = await tuningStore.getQueueState(); if (qs.pauseAfterCurrentMatch && e.data.type === "progress") { worker.postMessage({ type: "pause", tuningRunId }); await tuningStore.saveQueueState({ autoRunEnabled: false, pauseAfterCurrentMatch: false, message: "Queue paused after current match." }); } if (e.data.type === "idle") { worker.terminate(); resolve(); } if (e.data.type === "error") { await tuningStore.failQueueItem(queueItemId, e.data.message); worker.terminate(); resolve(); } }; worker.onerror = async (err) => { await tuningStore.failQueueItem(queueItemId, err.message); worker.terminate(); resolve(); }; worker.postMessage({ type: "run", tuningRunId }); }); }
-async function renderQueue(): Promise<void> { const dash = document.querySelector("#queue-dashboard"); if (!dash) return; const [items, state, aggregate] = await Promise.all([tuningStore.listQueueItems(), tuningStore.getQueueState(), tuningStore.queueAggregateSummary()]); const counts = { pending: items.filter(i=>i.status==="queued").length, completed: items.filter(i=>i.status==="completed").length, failed: items.filter(i=>i.status==="failed").length, running: items.filter(i=>i.status==="running").length }; const active = items.find(i=>i.status==="running"); let activeProgress = "No active run"; if (active?.tuningRunId) { const snap = await tuningStore.loadTuningRun(active.tuningRunId); if (snap) activeProgress = `${snap.run.completedMatches}/${snap.run.totalMatches} matches • generation ${snap.run.currentGeneration + 1}/${snap.run.generationsRequested} • current ${snap.run.currentMatchId ?? "none"}`; }
-  dash.innerHTML = `<div class="metrics"><div><b>Queue status</b><span>${state.autoRunEnabled ? "auto-running" : "paused"}</span></div><div><b>Active run progress</b><span>${activeProgress}</span></div><div><b>Pending</b><span>${counts.pending}</span></div><div><b>Completed runs</b><span>${counts.completed}</span></div><div><b>Failed runs</b><span>${counts.failed}</span></div><div><b>Aggregate</b><span>${aggregate.completed} complete, ${aggregate.failed} failed; best recommendation ${aggregate.bestRecommendationFound}; eligible manual promotion ${aggregate.anyEligibleManualPromotionCandidate ? "yes" : "no"}; beat baseline ${aggregate.anyRunBeatSelectedBaseline ? "yes" : "no"}; strongest ${aggregate.strongestCandidateId ?? "pending"}</span></div></div><p>${state.message ?? "Queue ready."}</p><table><thead><tr><th>Run</th><th>Baseline</th><th>Status</th><th>Linked run</th><th>Auto-export</th><th>Recommendation</th><th>Validation</th><th>Holdout</th><th>Failed</th><th>Manual review</th><th>Actions</th></tr></thead><tbody>${items.map(queueRow).join("")}</tbody></table>`; }
+async function renderQueue(statusMessage?: string): Promise<void> { const dash = document.querySelector("#queue-dashboard"); if (!dash) return; try { const [items, state, aggregate] = await Promise.all([tuningStore.listQueueItems(), tuningStore.getQueueState(), tuningStore.queueAggregateSummary()]); const counts = { pending: items.filter(i=>i.status==="queued").length, completed: items.filter(i=>i.status==="completed").length, failed: items.filter(i=>i.status==="failed").length, running: items.filter(i=>i.status==="running").length }; const active = items.find(i=>i.status==="running"); let activeProgress = "No active run"; if (active?.tuningRunId) { const snap = await tuningStore.loadTuningRun(active.tuningRunId); if (snap) activeProgress = `${snap.run.completedMatches}/${snap.run.totalMatches} matches • generation ${snap.run.currentGeneration + 1}/${snap.run.generationsRequested} • current ${snap.run.currentMatchId ?? "none"}`; }
+  dash.innerHTML = `<div class="metrics"><div><b>Queue status</b><span>${state.autoRunEnabled ? "auto-running" : "paused"}</span></div><div><b>Active run progress</b><span>${activeProgress}</span></div><div><b>Pending</b><span>${counts.pending}</span></div><div><b>Completed runs</b><span>${counts.completed}</span></div><div><b>Failed runs</b><span>${counts.failed}</span></div><div><b>Aggregate</b><span>${aggregate.completed} complete, ${aggregate.failed} failed; best recommendation ${aggregate.bestRecommendationFound}; eligible manual promotion ${aggregate.anyEligibleManualPromotionCandidate ? "yes" : "no"}; beat baseline ${aggregate.anyRunBeatSelectedBaseline ? "yes" : "no"}; strongest ${aggregate.strongestCandidateId ?? "pending"}</span></div></div><p>${statusMessage ?? state.message ?? (items.length ? "Queue loaded." : "Queue loaded. No queued jobs yet.")}</p><table><thead><tr><th>Run</th><th>Baseline</th><th>Status</th><th>Linked run</th><th>Auto-export</th><th>Recommendation</th><th>Validation</th><th>Holdout</th><th>Failed</th><th>Manual review</th><th>Actions</th></tr></thead><tbody>${items.map(queueRow).join("")}</tbody></table>${items.length ? "" : `<p>No queued tuning jobs yet.</p>`}`; } catch (err) { const message = err instanceof Error ? err.message : String(err); dash.innerHTML = `<p class="warning">Queue load failed: ${message}</p>`; setDownloadFeedback(`Queue load failed: ${message}`, true); } }
 function queueRow(i: TuningQueueItem): string { const s=i.summary; return `<tr><td>${i.runName}</td><td>${i.baselineProfileId}</td><td>${i.status}${i.errorMessage?`: ${i.errorMessage}`:""}</td><td>${i.tuningRunId ? `<button data-queue="view" data-run="${i.tuningRunId}">${i.tuningRunId}</button>` : "not created"}</td><td>${i.autoExportStatus}</td><td>${s?.recommendation ?? "pending"}</td><td>${s?.validationScore ?? "pending"}</td><td>${s?.holdoutScore ?? "pending"}</td><td>${s?.failedMatches ?? 0}</td><td>${s?.manualReviewRequired ? "Manual review required" : "—"}</td><td>${i.status === "queued" ? `<button data-queue="cancel" data-id="${i.queueItemId}">Cancel queued job</button>` : ""}${i.status === "failed" ? `<button data-queue="retry" data-id="${i.queueItemId}">Retry failed job</button>` : ""}${i.status === "running" ? `<button data-queue="cancel-run" data-run="${i.tuningRunId}">Cancel current run</button>` : ""}${i.autoExportStatus === "succeeded" ? `<button data-queue="download" data-id="${i.queueItemId}">Downloads</button>` : ""}</td></tr>`; }
 async function queueAction(event: Event): Promise<void> { const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-queue]"); if (!button) return; const action = button.dataset.queue!; if (action === "view" && button.dataset.run) { const snap = await tuningStore.loadTuningRun(button.dataset.run); await renderTuningRuns(snap); } if (action === "cancel" && button.dataset.id) await tuningStore.cancelQueuedJob(button.dataset.id); if (action === "retry" && button.dataset.id) await tuningStore.retryFailedQueueJob(button.dataset.id); if (action === "cancel-run" && button.dataset.run) { activeQueueRun?.worker?.postMessage({ type: "cancel", tuningRunId: button.dataset.run }); await tuningStore.cancelTuningRun(button.dataset.run); } if (action === "download" && button.dataset.id) { const records = await tuningStore.listQueueExportRecords(button.dataset.id); for (const r of records) setDownloadFeedback(`Export-ready: ${r.filename} (${r.files.length} files).`); } await renderQueue(); await renderTuningRuns(); }
