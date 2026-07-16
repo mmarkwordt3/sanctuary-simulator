@@ -148,3 +148,87 @@ describe("persistent evolutionary tuning lifecycle", () => {
   });
 
 });
+
+
+describe("phase 4 tuning queue", () => {
+  async function finishRun(store: TuningStore, runId: string) {
+    for (let guard = 0; guard < 100; guard++) {
+      const snap = (await store.loadTuningRun(runId))!;
+      if (snap.run.status === "completed") return snap;
+      const match = await store.nextQueuedMatch(runId);
+      if (!match) continue;
+      await store.markMatchRunning(runId, match.matchId);
+      await store.completeMatch(runId, match.matchId, { result: guard % 2 ? "blue" : "green", plies: 8, drawReason: null, diagnostics: { illegalMoves: 0, uniquePositionsVisited: 6 }, replayOk: true });
+    }
+    throw new Error("run did not finish");
+  }
+
+  it("creates queued jobs, persists across reload, starts first, and avoids duplicate run creation", async () => {
+    const name = dbName();
+    let store = new TuningStore(name);
+    const settings = quickSettings();
+    const item = await store.enqueueTuningJob("Small validation", settings.baselineProfileId, settings);
+    expect(item.status).toBe("queued");
+    store.close();
+    store = new TuningStore(name);
+    expect((await store.listQueueItems())[0].queueItemId).toBe(item.queueItemId);
+    const run1 = await store.createRunForQueueItem(item.queueItemId);
+    const run2 = await store.createRunForQueueItem(item.queueItemId);
+    expect(run2.tuningRunId).toBe(run1.tuningRunId);
+    await store.recoverQueueAfterReload();
+    const recovered = (await store.getQueueItem(item.queueItemId))!;
+    expect(recovered.tuningRunId).toBe(run1.tuningRunId);
+  });
+
+  it("automatically starts next queued job after completion and pause after current run stops auto-run", async () => {
+    const store = new TuningStore(dbName());
+    const first = await store.enqueueTuningJob("first", "production-baseline-v1", quickSettings());
+    const second = await store.enqueueTuningJob("second", "production-baseline-v1", quickSettings());
+    await store.startQueue();
+    const run = await store.createRunForQueueItem(first.queueItemId);
+    await finishRun(store, run.tuningRunId);
+    await store.syncQueueItemFromRun(first.queueItemId);
+    await store.autoExportQueueItem(first.queueItemId);
+    const next = await store.nextQueuedItem();
+    expect(next!.queueItemId).toBe(second.queueItemId);
+    const run2 = await store.createRunForQueueItem(second.queueItemId);
+    expect(run2.name).toBe("second");
+    await store.pauseQueue("run");
+    expect((await store.getQueueState()).pauseAfterCurrentRun).toBe(true);
+  }, 30000);
+
+  it("cancels queued jobs, retries failed jobs, captures errors, and records export-ready files", async () => {
+    const store = new TuningStore(dbName());
+    const cancelled = await store.enqueueTuningJob("cancel me", "production-baseline-v1", quickSettings());
+    await store.cancelQueuedJob(cancelled.queueItemId);
+    expect((await store.getQueueItem(cancelled.queueItemId))!.status).toBe("cancelled");
+    const failed = await store.enqueueTuningJob("fail me", "production-baseline-v1", quickSettings());
+    await store.failQueueItem(failed.queueItemId, "worker exploded");
+    expect((await store.getQueueItem(failed.queueItemId))!.errorMessage).toBe("worker exploded");
+    await store.retryFailedQueueJob(failed.queueItemId);
+    expect((await store.getQueueItem(failed.queueItemId))!.status).toBe("queued");
+    const run = await store.createRunForQueueItem(failed.queueItemId);
+    const final = await finishRun(store, run.tuningRunId);
+    await store.syncQueueItemFromRun(failed.queueItemId);
+    await store.autoExportQueueItem(failed.queueItemId);
+    expect((await store.listQueueExportRecords(failed.queueItemId)).map(r=>r.kind)).toContain("full-tuning-export");
+    expect((await store.listQueueExportRecords(failed.queueItemId)).map(r=>r.kind)).toContain("promotion-report");
+    expect((await store.getQueueItem(failed.queueItemId))!.summary!.runName).toBe("fail me");
+    expect(final.candidates.some(c => c.promoted)).toBe(false);
+  }, 30000);
+
+  it("queue uses selected experimental baseline and aggregate summary reflects completed runs", async () => {
+    const store = new TuningStore(dbName());
+    const seed = await store.createTuningRun(quickSettings());
+    const approved = await store.approveCandidate(seed.tuningRunId, (await store.loadTuningRun(seed.tuningRunId))!.candidates[1].candidateId);
+    const settings = quickSettings(); settings.baselineProfileId = approved.profileId;
+    const item = await store.enqueueTuningJob("confirmation", approved.profileId, settings);
+    const run = await store.createRunForQueueItem(item.queueItemId);
+    expect(run.baselineProfileId).toBe(approved.profileId);
+    await finishRun(store, run.tuningRunId);
+    await store.syncQueueItemFromRun(item.queueItemId);
+    const aggregate = await store.queueAggregateSummary();
+    expect(aggregate.completed).toBe(1);
+    expect(aggregate.bestRecommendationFound).not.toBe("none");
+  }, 30000);
+});

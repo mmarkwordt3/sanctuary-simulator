@@ -4,7 +4,7 @@ import { buildTargetedJobs, playExperimentGame, replayStoredGame as verifyStored
 import { jsonl, markdownSummary, toCsv, type ExportFile } from "./exporters.ts";
 import { analyzeExperiment, analysisExportFiles, type AnalysisFlag, type ExperimentAnalysis, type FollowUpProposal } from "./analysis.ts";
 
-export const EXPERIMENT_SCHEMA_VERSION = 3;
+export const EXPERIMENT_SCHEMA_VERSION = 4;
 export const EXPERIMENT_DB_NAME = "sanctuary-automated-experiments";
 export type ExperimentStatus = "draft" | "queued" | "running" | "paused" | "completed" | "cancelled" | "failed";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
