@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { productionEvaluationProfile } from "../../simulator/evaluation-profiles.ts";
 import { acceptanceTuningSettings } from "../../simulator/tuning.ts";
+import { ExperimentStore } from "../src/experiments.ts";
 import { TuningStore } from "../src/tuning-store.ts";
 import { installIndexedDbShim } from "./indexeddb-shim.ts";
 
@@ -231,4 +233,40 @@ describe("phase 4 tuning queue", () => {
     expect(aggregate.completed).toBe(1);
     expect(aggregate.bestRecommendationFound).not.toBe("none");
   }, 30000);
+});
+
+
+describe("phase 4 queue initialization regression coverage", () => {
+  it("renders queue stores after schema v4 is first opened by experiment storage", async () => {
+    const name = dbName();
+    const experiments = new ExperimentStore(name);
+    await experiments.pauseRecovery();
+    const store = new TuningStore(name);
+    expect(await store.listQueueItems()).toEqual([]);
+    const state = await store.getQueueState();
+    expect(state.autoRunEnabled).toBe(false);
+  });
+
+  it("adds production-baseline-v1 jobs and persists them across reload", async () => {
+    const name = dbName();
+    const store = new TuningStore(name);
+    const settings = quickSettings();
+    const item = await store.enqueueTuningJob("Small validation", "production-baseline-v1", settings);
+    expect(item.queueItemId).toContain("queue-");
+    await store.close();
+    const reloaded = new TuningStore(name);
+    expect((await reloaded.listQueueItems()).map((i) => i.queueItemId)).toContain(item.queueItemId);
+  });
+
+  it("approved experimental profiles appear after schema v4 upgrade and absence does not block queue", async () => {
+    const name = dbName();
+    const store = new TuningStore(name);
+    expect(await store.listApprovedExperimentalProfiles()).toEqual([]);
+    expect(await store.listQueueItems()).toEqual([]);
+    const run = await store.createTuningRun(quickSettings());
+    const snap = (await store.loadTuningRun(run.tuningRunId))!;
+    const profile = snap.profiles.find((p) => p.profileId !== "production-baseline-v1") ?? productionEvaluationProfile();
+    const approved = await store.approveCandidate(run.tuningRunId, snap.candidates.find((c) => c.profileId === profile.profileId)?.candidateId ?? snap.candidates[0].candidateId);
+    expect((await store.listApprovedExperimentalProfiles()).map((p) => p.profileId)).toContain(approved.profileId);
+  });
 });

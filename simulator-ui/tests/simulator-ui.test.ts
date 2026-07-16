@@ -111,6 +111,24 @@ describe("simulator UI layout", () => {
     expect(source).toContain("if (!document.querySelector<HTMLDetailsElement>(\"#advanced-constraints\")?.open)");
   });
 
+
+  it("documents Phase 4 queue loading, empty, success, and failure UI states", () => {
+    const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    expect(main).toContain("Queue load failed:");
+    expect(main).toContain("No queued tuning jobs yet.");
+    expect(main).toContain("Job added:");
+    expect(main).toContain("Job add failed:");
+    expect(main).toContain("queueInitialized");
+  });
+
+  it("loads small validation presets into every Section 9 field needed by the queue", () => {
+    const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    for (const id of ["#tune-name", "#tune-baseline", "#tune-candidates", "#tune-generations", "#tune-depth", "#tune-games", "#tune-seeds", "#tune-seed-start", "#tune-rate", "#tune-magnitude", "#tune-elites", "#tune-max-plies", "#tune-no-progress", "#tune-openings", "#tune-auto-pause", "#tune-mirrored", "#tune-baseline-matches", "#tune-peer-matches"]) {
+      expect(main).toContain(id);
+    }
+    expect(main).toContain("Preset loaded into editor");
+  });
+
   it("keeps run controls in a sticky panel with visible progress", () => {
     const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
