@@ -56,7 +56,7 @@ export interface TuningSnapshot { run: TuningRunRecord; profiles: EvaluationProf
 export interface ApprovedExperimentalProfileMetadata { sourceTuningRunId: string; sourceCandidateId: string; approvedAt: string; parentOrBaselineProfileId: string; evaluationWeights: EvaluationProfile["weights"]; status: "approved-experimental"; }
 export type ApprovedEvaluationProfile = EvaluationProfile & { experimentalApproval: ApprovedExperimentalProfileMetadata };
 
-const STORES = ["evaluationProfiles", "tuningRuns", "tuningCandidates", "tuningMatches", "tuningGenerations", "promotionReports"];
+const STORES = ["evaluationProfiles", "tuningRuns", "tuningCandidates", "tuningMatches", "tuningGenerations", "promotionReports", "tuningQueue", "tuningQueueState", "tuningQueueExports"];
 function now() { return new Date().toISOString(); }
 function id(prefix: string) { return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; }
 function generationKey(tuningRunId: string, generation: number) { return `${tuningRunId}-generation-${generation}`; }
@@ -84,6 +84,9 @@ function openDb(name = EXPERIMENT_DB_NAME): Promise<IDBDatabase> {
       ensure("tuningMatches", "matchId", [["tuningRunId", "tuningRunId"], ["status", "status"], ["tuningRunId_status", ["tuningRunId", "status"]], ["tuningRunId_generation", ["tuningRunId", "generation"]], ["candidate_pair", ["candidateAProfileId", "candidateBProfileId"]], ["opening", "opening"], ["seed", "seed"]]);
       ensure("tuningGenerations", "generationKey", [["tuningRunId", "tuningRunId"], ["generation", "generation"]]);
       ensure("promotionReports", "reportId", [["tuningRunId", "tuningRunId"], ["profileId", "profileId"]]);
+      ensure("tuningQueue", "queueItemId", [["status", "status"], ["tuningRunId", "tuningRunId"], ["createdAt", "createdAt"]]);
+      ensure("tuningQueueState", "stateId");
+      ensure("tuningQueueExports", "recordId", [["queueItemId", "queueItemId"], ["tuningRunId", "tuningRunId"], ["kind", "kind"]]);
     };
     request.onerror = () => reject(request.error);
     request.onsuccess = () => resolve(request.result);
@@ -99,6 +102,22 @@ export function openingPrefix(label: string): Move[] {
   const simple = label.trim();
   const found = moves.find((m) => `${fromCoord(initial.pieces.find((p) => p.id === m.pieceId) ?? m.to)}-${fromCoord(m.to)}` === simple || describeMove(m).endsWith(simple));
   return found ? [found] : [];
+}
+
+
+export type TuningQueueStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type QueueAutoExportStatus = "pending" | "succeeded" | "failed" | "not-ready";
+export interface TuningQueueSummary { runName?: string; baselineProfileId?: string; overallChampionCandidateId?: string|null; overallChampionProfileId?: string|null; finalGenerationBestCandidateId?: string|null; recommendation?: string; validationScore?: number|null; holdoutScore?: number|null; failedMatches?: number; promotionCandidateExists?: boolean; selectedBaselineRemainedChampion?: boolean; beatSelectedBaseline?: boolean; strongestCandidateId?: string|null; strongestProfileId?: string|null; highestFinalGenerationScore?: number|null; manualReviewRequired?: boolean; }
+export interface TuningQueueExportRecord { recordId: string; queueItemId: string; tuningRunId: string; kind: "full-tuning-export" | "promotion-report"; filename: string; files: ExportFile[]; createdAt: string; }
+export interface TuningQueueItem { queueItemId: string; runName: string; baselineProfileId: string; settings: TuningRunSettings; status: TuningQueueStatus; tuningRunId: string|null; createdAt: string; startedAt: string|null; completedAt: string|null; errorMessage: string|null; autoExportStatus: QueueAutoExportStatus; autoExportError?: string|null; summary?: TuningQueueSummary|null; }
+export interface TuningQueueState { stateId: "singleton"; autoRunEnabled: boolean; pauseAfterCurrentMatch: boolean; pauseAfterCurrentRun: boolean; activeQueueItemId: string|null; updatedAt: string; message: string|null; }
+export const QUEUE_PRESET_OPENINGS = ["C1-B1", "K1-L1", "D3-E3", "J3-I3"];
+export function tuningQueuePreset(name: "Small validation"|"Broad search"|"Confirmation", baselineProfileId = PRODUCTION_PROFILE_ID): TuningRunSettings {
+  const base = acceptanceTuningSettings();
+  const common = { ...base, name, baselineProfileId, openingSuite: QUEUE_PRESET_OPENINGS, mirroredOpeningsRequired: true, candidateVsBaseline: true, candidateVsCandidate: true, autoPauseAfterGeneration: false, noProgressPlyLimit: 24 };
+  if (name === "Small validation") return { ...common, candidateCount: 4, generationsRequested: 2, searchDepth: 1, gamesPerPairing: 1, seedSet: [1,2], maxPlies: 40, mutationSettings: { ...base.mutationSettings, mutationRate: 0.30, mutationMagnitude: 0.10, eliteCount: 1 } };
+  if (name === "Broad search") return { ...common, candidateCount: 8, generationsRequested: 4, searchDepth: 2, gamesPerPairing: 1, seedSet: [1,2,3,4,5,6], maxPlies: 60, mutationSettings: { ...base.mutationSettings, mutationRate: 0.55, mutationMagnitude: 0.25, eliteCount: 2 } };
+  return { ...common, candidateCount: 4, generationsRequested: 2, searchDepth: 2, gamesPerPairing: 2, seedSet: [1,2,3,4,5,6], maxPlies: 60, mutationSettings: { ...base.mutationSettings, mutationRate: 0.30, mutationMagnitude: 0.10, eliteCount: 1 } };
 }
 
 export class TuningStore {
@@ -314,6 +333,72 @@ export class TuningStore {
     await txDone(db.transaction(["tuningRuns", "tuningMatches"], "readwrite"), (tx) => { tx.objectStore("tuningMatches").put({ ...match, status: "failed", failureMessage, completedAt: stamp }); tx.objectStore("tuningRuns").put({ ...snap.run, failedMatches: snap.run.failedMatches + 1, currentMatchId: null, currentWorkerState: "idle", updatedAt: stamp }); });
   }
 
+
+  async getQueueState(): Promise<TuningQueueState> {
+    const db = await this.db();
+    const existing = await get<TuningQueueState>(db, "tuningQueueState", "singleton");
+    return existing ?? { stateId: "singleton", autoRunEnabled: false, pauseAfterCurrentMatch: false, pauseAfterCurrentRun: false, activeQueueItemId: null, updatedAt: now(), message: null };
+  }
+  async saveQueueState(patch: Partial<TuningQueueState>): Promise<TuningQueueState> {
+    const state = { ...(await this.getQueueState()), ...patch, stateId: "singleton" as const, updatedAt: now() };
+    const db = await this.db();
+    await txDone(db.transaction(["tuningQueueState"], "readwrite"), (tx) => tx.objectStore("tuningQueueState").put(state));
+    return state;
+  }
+  async enqueueTuningJob(runName: string, baselineProfileId: string, settings: TuningRunSettings): Promise<TuningQueueItem> {
+    await this.resolveBaselineProfile(baselineProfileId);
+    const stamp = now();
+    const item: TuningQueueItem = { queueItemId: id("queue"), runName, baselineProfileId, settings: { ...settings, name: runName, baselineProfileId, autoPauseAfterGeneration: false }, status: "queued", tuningRunId: null, createdAt: stamp, startedAt: null, completedAt: null, errorMessage: null, autoExportStatus: "pending", summary: null };
+    const db = await this.db();
+    await txDone(db.transaction(["tuningQueue"], "readwrite"), (tx) => tx.objectStore("tuningQueue").put(item));
+    return item;
+  }
+  async listQueueItems(): Promise<TuningQueueItem[]> { return (await getAll<TuningQueueItem>(await this.db(), "tuningQueue")).sort((a,b)=>a.createdAt.localeCompare(b.createdAt)); }
+  async getQueueItem(queueItemId: string) { return get<TuningQueueItem>(await this.db(), "tuningQueue", queueItemId); }
+  async nextQueuedItem(): Promise<TuningQueueItem|null> { return (await this.listQueueItems()).find(i=>i.status==="queued") ?? null; }
+  async startQueue() { await this.saveQueueState({ autoRunEnabled: true, pauseAfterCurrentMatch: false, pauseAfterCurrentRun: false, message: "Queue started. Keep this browser tab open and awake." }); }
+  async pauseQueue(after: "match"|"run") { await this.saveQueueState({ autoRunEnabled: after === "match", pauseAfterCurrentMatch: after === "match", pauseAfterCurrentRun: after === "run", message: after === "match" ? "Queue will pause after the current match." : "Queue will pause after the current run." }); }
+  async resumeQueue() { await this.saveQueueState({ autoRunEnabled: true, pauseAfterCurrentMatch: false, pauseAfterCurrentRun: false, message: "Queue resumed. Keep this browser tab open and awake." }); }
+  async cancelQueuedJob(queueItemId: string) { const item = await this.getQueueItem(queueItemId); if (!item || item.status !== "queued") return; await this.putQueueItem({ ...item, status: "cancelled", completedAt: now(), errorMessage: "Cancelled before start." }); }
+  async retryFailedQueueJob(queueItemId: string) { const item = await this.getQueueItem(queueItemId); if (!item || item.status !== "failed") return; await this.putQueueItem({ ...item, status: "queued", tuningRunId: null, startedAt: null, completedAt: null, errorMessage: null, autoExportStatus: "pending", autoExportError: null, summary: null }); }
+  async createRunForQueueItem(queueItemId: string): Promise<TuningRunRecord> {
+    const item = await this.getQueueItem(queueItemId); if (!item) throw new Error("Queue item not found");
+    if (item.tuningRunId) { const existing = await this.loadTuningRun(item.tuningRunId); if (existing) return existing.run; }
+    const run = await this.createTuningRun({ ...item.settings, name: item.runName, baselineProfileId: item.baselineProfileId, autoPauseAfterGeneration: false });
+    await this.putQueueItem({ ...item, status: "running", tuningRunId: run.tuningRunId, startedAt: item.startedAt ?? now(), errorMessage: null });
+    await this.saveQueueState({ activeQueueItemId: queueItemId, message: `Started queued run ${item.runName}.` });
+    return run;
+  }
+  async syncQueueItemFromRun(queueItemId: string): Promise<TuningQueueItem|null> {
+    const item = await this.getQueueItem(queueItemId); if (!item?.tuningRunId) return item ?? null;
+    const snap = await this.loadTuningRun(item.tuningRunId); if (!snap) return item;
+    const patch: Partial<TuningQueueItem> = {};
+    if (snap.run.status === "completed") Object.assign(patch, { status: "completed" as const, completedAt: snap.run.completedAt ?? now(), summary: summarizeQueueRun(snap) });
+    if (snap.run.status === "failed" || snap.run.status === "cancelled") Object.assign(patch, { status: snap.run.status as "failed"|"cancelled", completedAt: now(), errorMessage: snap.run.status });
+    if (Object.keys(patch).length) { const updated = { ...item, ...patch }; await this.putQueueItem(updated); return updated; }
+    return item;
+  }
+  async failQueueItem(queueItemId: string, errorMessage: string) { const item = await this.getQueueItem(queueItemId); if (!item) return; await this.putQueueItem({ ...item, status: "failed", completedAt: now(), errorMessage }); await this.saveQueueState({ message: `Queue job failed: ${errorMessage}` }); }
+  async autoExportQueueItem(queueItemId: string): Promise<void> {
+    const item = await this.getQueueItem(queueItemId); if (!item?.tuningRunId) return;
+    try { const files = await this.exportTuningRun(item.tuningRunId); const promotion = files.filter(f=>f.name === "promotion_report.md" || f.name === "promotion_report.json"); const stamp = now(); const records: TuningQueueExportRecord[] = [{ recordId: `${queueItemId}-full`, queueItemId, tuningRunId: item.tuningRunId, kind: "full-tuning-export", filename: `${item.tuningRunId}-tuning-export.zip`, files, createdAt: stamp }, { recordId: `${queueItemId}-promotion`, queueItemId, tuningRunId: item.tuningRunId, kind: "promotion-report", filename: `${item.tuningRunId}-promotion-report.zip`, files: promotion, createdAt: stamp }]; const db=await this.db(); await txDone(db.transaction(["tuningQueueExports","tuningQueue"],"readwrite"), tx=>{ for(const r of records) tx.objectStore("tuningQueueExports").put(r); tx.objectStore("tuningQueue").put({ ...item, autoExportStatus: "succeeded", autoExportError: null }); }); }
+    catch(err) { await this.putQueueItem({ ...item, autoExportStatus: "failed", autoExportError: err instanceof Error ? err.message : String(err) }); }
+  }
+  async listQueueExportRecords(queueItemId?: string): Promise<TuningQueueExportRecord[]> { const all = await getAll<TuningQueueExportRecord>(await this.db(), "tuningQueueExports"); return queueItemId ? all.filter(r=>r.queueItemId===queueItemId) : all; }
+  async recoverQueueAfterReload(): Promise<TuningQueueState> {
+    await this.recoverInterruptedTuningRuns();
+    for (const item of await this.listQueueItems()) if (item.status === "running") await this.syncQueueItemFromRun(item.queueItemId);
+    const state = await this.getQueueState();
+    return state.autoRunEnabled ? this.saveQueueState({ message: "Queue recovered after reload; auto-run is enabled." }) : this.saveQueueState({ message: "Queue recovered after reload. Use Resume queue to continue." });
+  }
+  async queueAggregateSummary() {
+    const completed = (await this.listQueueItems()).filter(i=>i.status==="completed"); const failed = (await this.listQueueItems()).filter(i=>i.status==="failed");
+    const summaries = completed.map(i=>i.summary).filter(Boolean) as TuningQueueSummary[];
+    const best = summaries.find(s=>s.recommendation === "eligible for manual promotion") ?? summaries[0];
+    return { completed: completed.length, failed: failed.length, bestRecommendationFound: best?.recommendation ?? "none", anyEligibleManualPromotionCandidate: summaries.some(s=>s.promotionCandidateExists), anyRunBeatSelectedBaseline: summaries.some(s=>s.beatSelectedBaseline), highestFinalGenerationScore: Math.max(...summaries.map(s=>s.highestFinalGenerationScore ?? -Infinity), -Infinity), strongestCandidateId: best?.strongestCandidateId ?? null, strongestProfileId: best?.strongestProfileId ?? null };
+  }
+  private async putQueueItem(item: TuningQueueItem) { const db=await this.db(); await txDone(db.transaction(["tuningQueue"],"readwrite"), tx=>tx.objectStore("tuningQueue").put(item)); }
+
   private async setRunStatus(tuningRunId: string, status: TuningStatus, requeueRunning = false) {
     const snap = await this.loadTuningRun(tuningRunId); if (!snap) return;
     const db = await this.db(); const stamp = now();
@@ -342,4 +427,10 @@ export async function executePersistedTuningMatch(store: TuningStore, tuningRunI
   const prefix = openingPrefix(match.opening);
   const game = playExperimentGame({ id: 1, seed: match.seed, greenAgent: "search-alpha-beta-deterministic", blueAgent: "search-alpha-beta-deterministic", greenDiversity: 0, blueDiversity: 0, searchDepth: match.searchDepth, maxPlies: snap.run.maxPlies, noProgressPlyLimit: snap.run.noProgressPlyLimit, positionSampling: "none", positions: [], forcedPrefix: prefix, opening: match.opening, greenEvaluationProfile: profiles.get(match.greenProfileId), blueEvaluationProfile: profiles.get(match.blueProfileId), timeLimitMs: snap.run.timeLimitMs });
   await store.completeMatch(tuningRunId, match.matchId, { result: game.winner === "green" || game.winner === "blue" ? game.winner : "draw", plies: game.plies, drawReason: game.drawReason, replayOk: game.replayOk, diagnostics: { illegalMoves: game.metrics.illegalMoves, replayOk: game.replayOk, uniquePositionsVisited: game.repetitionDiagnostics.uniquePositionsVisited, repetitionDraw: game.repetitionDiagnostics.repetitionDraw, noProgressDraw: game.repetitionDiagnostics.noProgressDraw, first10: game.first10 } });
+}
+
+
+export function summarizeQueueRun(snap: TuningSnapshot): TuningQueueSummary {
+  const r = snap.run; const report = snap.reports[0]; const champion = snap.candidates.find(c=>c.candidateId===r.overallChampionCandidateId); const finalBest = snap.candidates.find(c=>c.candidateId===r.finalGenerationBestCandidateId); const strongest = champion ?? finalBest ?? [...snap.candidates].sort((a,b)=>b.score-a.score)[0];
+  return { runName: r.name, baselineProfileId: r.selectedBaselineProfileId ?? r.baselineProfileId, overallChampionCandidateId: r.overallChampionCandidateId, overallChampionProfileId: r.overallChampionProfileId, finalGenerationBestCandidateId: r.finalGenerationBestCandidateId, recommendation: report?.recommendation ?? "pending", validationScore: strongest?.scoreBreakdown?.validationScore ?? null, holdoutScore: strongest?.scoreBreakdown?.holdoutScore ?? null, failedMatches: r.failedMatches, promotionCandidateExists: !!r.promotionCandidateId, selectedBaselineRemainedChampion: !!r.overallChampionIsSelectedBaseline, beatSelectedBaseline: !!r.overallChampionProfileId && r.overallChampionProfileId !== (r.selectedBaselineProfileId ?? r.baselineProfileId), strongestCandidateId: strongest?.candidateId ?? null, strongestProfileId: strongest?.profileId ?? null, highestFinalGenerationScore: finalBest?.score ?? null, manualReviewRequired: !!r.promotionCandidateId };
 }
