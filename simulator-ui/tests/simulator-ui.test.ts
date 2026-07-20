@@ -138,4 +138,16 @@ describe("simulator UI layout", () => {
     expect(css).toContain("position: fixed");
     expect(css).toContain(".scroll-list { max-height");
   });
+
+  it("documents positive manual-review recommendation UI fields for Section 9 and Phase 4 queue", () => {
+    const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    expect(main).toContain("Champion is baseline");
+    expect(main).toContain("Selected baseline");
+    expect(main).toContain("Final-generation best");
+    expect(main).toContain("Manual review required");
+    expect(main).toContain("Approve as experimental profile");
+    expect(main).toContain("Reject candidate");
+    expect(main).toContain("eligible manual promotion");
+    expect(main).toContain("never auto-promotes candidates");
+  });
 });
