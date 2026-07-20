@@ -270,3 +270,62 @@ describe("phase 4 queue initialization regression coverage", () => {
     expect((await store.listApprovedExperimentalProfiles()).map((p) => p.profileId)).toContain(approved.profileId);
   });
 });
+
+describe("positive recommendation smoke coverage", () => {
+  async function finishPositiveRun(store: TuningStore, runId: string) {
+    let preferredProfileId: string | null = null;
+    for (let guard = 0; guard < 120; guard++) {
+      const snap = (await store.loadTuningRun(runId))!;
+      if (snap.run.status === "completed") return snap;
+      preferredProfileId ??= snap.candidates.find(c => c.profileId !== snap.run.baselineProfileId)?.profileId ?? null;
+      const match = await store.nextQueuedMatch(runId);
+      if (!match) continue;
+      if (match.fixture !== "training") preferredProfileId = match.candidateAProfileId === snap.run.baselineProfileId ? match.candidateBProfileId : match.candidateAProfileId;
+      const candidateIsGreen = match.greenProfileId === preferredProfileId;
+      const candidateIsBlue = match.blueProfileId === preferredProfileId;
+      await store.markMatchRunning(runId, match.matchId);
+      await store.completeMatch(runId, match.matchId, { result: candidateIsGreen ? "green" : candidateIsBlue ? "blue" : "green", plies: 8, drawReason: null, diagnostics: { illegalMoves: 0, uniquePositionsVisited: 12 }, replayOk: true });
+    }
+    throw new Error("positive run did not finish");
+  }
+
+  it("surfaces eligible manual-review candidates in run, queue summary, and auto-exports without auto-approval", async () => {
+    const store = new TuningStore(dbName());
+    const settings = quickSettings();
+    settings.candidateCount = 2;
+    settings.generationsRequested = 1;
+    settings.antiOverfitSettings.validationSeeds = [101, 103];
+    settings.antiOverfitSettings.holdoutSeeds = [1001, 1003];
+    const item = await store.enqueueTuningJob("Synthetic positive", settings.baselineProfileId, settings);
+    const run = await store.createRunForQueueItem(item.queueItemId);
+    const final = await finishPositiveRun(store, run.tuningRunId);
+
+    expect(final.run.status).toBe("completed");
+    expect(final.run.promotionCandidateId).toBeTruthy();
+    expect(final.run.overallChampionIsSelectedBaseline).toBe(false);
+    expect(final.reports[0].recommendation).toBe("eligible for manual promotion");
+    expect(final.reports[0].eligible).toBe(true);
+    expect(final.reports[0].approvedAt).toBeUndefined();
+    expect(final.candidates.some(c => c.promoted)).toBe(false);
+    expect(await store.listApprovedExperimentalProfiles()).toEqual([]);
+
+    await store.syncQueueItemFromRun(item.queueItemId);
+    const queued = (await store.getQueueItem(item.queueItemId))!;
+    expect(queued.status).toBe("completed");
+    expect(queued.summary!.recommendation).toBe("eligible for manual promotion");
+    expect(queued.summary!.manualReviewRequired).toBe(true);
+    expect(queued.summary!.promotionCandidateExists).toBe(true);
+    expect(queued.summary!.beatSelectedBaseline).toBe(true);
+    expect(queued.summary!.baselineProfileId).toBe(settings.baselineProfileId);
+
+    const aggregate = await store.queueAggregateSummary();
+    expect(aggregate.anyEligibleManualPromotionCandidate).toBe(true);
+    expect(aggregate.anyRunBeatSelectedBaseline).toBe(true);
+    expect(aggregate.bestRecommendationFound).toBe("eligible for manual promotion");
+
+    await store.autoExportQueueItem(item.queueItemId);
+    const records = await store.listQueueExportRecords(item.queueItemId);
+    expect(records.find(r => r.kind === "promotion-report")!.files.find(f => f.name === "promotion_report.json")!.content).toContain("eligible for manual promotion");
+    expect(records.find(r => r.kind === "full-tuning-export")!.files.find(f => f.name === "promotion_report.md")!.content).toContain("No candidate is automatically promoted");
+  }, 30000);
+});
