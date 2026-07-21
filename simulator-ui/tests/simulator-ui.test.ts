@@ -139,6 +139,14 @@ describe("simulator UI layout", () => {
     expect(css).toContain(".scroll-list { max-height");
   });
 
+  it("documents Phase 5 planner controls and safety copy", () => {
+    const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    expect(main).toContain("11. Phase 5 / Automated Tuning Planner");
+    for (const id of ["#planner-analyze", "#planner-generate", "#planner-add", "#planner-export", "#planner-dashboard"]) expect(main).toContain(id);
+    expect(main).toContain("never auto-promotes candidates and never starts the queue");
+    expect(main).toContain("Queue remains paused");
+  });
+
   it("documents positive manual-review recommendation UI fields for Section 9 and Phase 4 queue", () => {
     const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     expect(main).toContain("Champion is baseline");
