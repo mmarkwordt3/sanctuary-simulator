@@ -9,7 +9,7 @@ import type { ExperimentWorkerResponse } from "./experiment-worker.ts";
 import type { RunResult } from "./simulation-runner.ts";
 import type { WorkerRequest, WorkerResponse } from "./worker.ts";
 import { acceptanceTuningSettings, DEFAULT_MIRRORED_OPENING_SUITE } from "../../simulator/tuning.ts";
-import { TuningStore, tuningMatchProgressLabel, tuningQueuePreset, type TuningQueueItem, type TuningSnapshot } from "./tuning-store.ts";
+import { TuningStore, tuningMatchProgressLabel, tuningQueuePreset, plannerReportExportFiles, type TuningPlannerReport, type TuningQueueItem, type TuningSnapshot } from "./tuning-store.ts";
 import "./styles.css";
 
 const experimentStore = new ExperimentStore();
@@ -17,6 +17,7 @@ const tuningStore = new TuningStore();
 let activeExperimentRun: { experimentId: string; pauseRequested: boolean; cancelRequested: boolean; running: boolean; worker: Worker | null } | null = null;
 let activeQueueRun: { worker: Worker | null; running: boolean; cancelRequested: boolean } | null = null;
 let queueInitialized = false;
+let currentPlannerReport: TuningPlannerReport | null = null;
 let currentExperimentView: { experimentId: string; page: number; pageSize: number; query: GameQuery; replayTimer: number | null; replayPly: number } | null = null;
 const state: { settings: SimulatorUiSettings; worker: Worker | null; result: RunResult | null; startedAt: number; paused: boolean } = {
   settings: structuredClone(DEFAULT_SETTINGS),
@@ -48,7 +49,8 @@ E1-F1
 I1-H1</textarea></label><p id="tune-estimate"></p><button id="tune-create">Create tuning run</button><button id="tune-acceptance">Run real acceptance scenario</button><div id="tune-dashboard"></div><div id="tune-profile-info"></div></section>
 
     <section class="card"><h2>10. Phase 4 / Tuning Queue</h2><p class="warning">Automated queue runs one tuning match at a time while this browser tab remains open and awake. It survives reloads, recovers running tuning runs, and never auto-promotes candidates; eligible candidates are marked Manual review required.</p><div class="grid"><label>Queue preset<select id="queue-preset"><option>Small validation</option><option>Broad search</option><option>Confirmation</option></select></label><label>Queue run name<input id="queue-name" value="Small validation"></label></div><p class="warning">Choose/edit baseline and tuning settings in the Evolutionary Tuning panel above, or load a preset here before adding it to the queue.</p><div class="advanced-actions"><button id="queue-load-preset" disabled>Load preset into editor</button><button id="queue-add" disabled>Add edited job to queue</button><button id="queue-start" disabled>Start queue</button><button id="queue-pause-match" disabled>Pause after current match</button><button id="queue-pause-run" disabled>Pause after current run</button><button id="queue-resume" disabled>Resume queue</button></div><div id="queue-dashboard">Loading queue…</div></section>
-    <section class="card"><h2>11. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
+    <section class="card"><h2>11. Phase 5 / Automated Tuning Planner</h2><p class="warning">The planner analyzes completed tuning history and drafts Phase 4 queue jobs only. It never auto-promotes candidates and never starts the queue.</p><div class="advanced-actions"><button id="planner-analyze">Analyze tuning history</button><button id="planner-generate" disabled>Generate proposed queue</button><button id="planner-add" disabled>Add proposed jobs to Phase 4 queue</button><button id="planner-export" disabled>Export planner report</button></div><div id="planner-dashboard">No planner analysis yet.</div></section>
+    <section class="card"><h2>12. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
   </div><aside class="run-panel" aria-label="Run controls"><h2>Run Simulation</h2><button id="start">Start</button><button id="pause" disabled>Pause</button><button id="resume" disabled>Resume</button><button id="cancel" disabled>Cancel</button><button id="reset">Reset</button><div class="mini-progress"><progress id="sticky-bar" value="0" max="100"></progress><div id="sticky-progress-text">No run started.</div></div></aside></main>`;
 
 renderForms();
@@ -141,6 +143,10 @@ function wireEvents(): void {
   document.querySelector("#queue-pause-match")!.addEventListener("click", async () => { await tuningStore.pauseQueue("match"); await renderQueue(); });
   document.querySelector("#queue-pause-run")!.addEventListener("click", async () => { await tuningStore.pauseQueue("run"); await renderQueue(); });
   document.querySelector("#queue-resume")!.addEventListener("click", startQueueRunner);
+  document.querySelector("#planner-analyze")!.addEventListener("click", analyzePlannerUi);
+  document.querySelector("#planner-generate")!.addEventListener("click", generatePlannerUi);
+  document.querySelector("#planner-add")!.addEventListener("click", addPlannerJobsUi);
+  document.querySelector("#planner-export")!.addEventListener("click", exportPlannerUi);
   document.querySelector("#experiment-dashboard")!.addEventListener("click", experimentAction);
   document.querySelector("#experiment-detail")!.addEventListener("click", experimentDetailAction);
   document.querySelector("#experiment-detail")!.addEventListener("change", experimentDetailChanged);
@@ -575,6 +581,34 @@ function applyTuningSettingsToEditor(s: ReturnType<typeof currentTuningSettings>
   (document.querySelector<HTMLInputElement>("#tune-peer-matches")!).checked = s.candidateVsCandidate;
   updateTuningEstimate();
 }
+function plannerReportHtml(report: TuningPlannerReport): string {
+  return `<div class="metrics"><div><b>Selected baseline profile</b><span>${report.selectedBaselineProfileId}</span></div><div><b>Completed tuning runs analyzed</b><span>${report.totalCompletedRuns}</span></div><div><b>Recent recommendations summary</b><span>${Object.entries(report.recommendationSummary).map(([k,v])=>`${k}: ${v}`).join(", ") || "none"}</span></div><div><b>Best recent candidate</b><span>${report.topCandidateSummary[0]?.candidateId ?? "none"} (${report.topCandidateSummary[0]?.score ?? "n/a"})</span></div><div><b>Baseline keeps winning</b><span>${report.baselineKeepsWinning ? "yes" : "no"}</span></div><div><b>Manual review</b><span>${report.manualReviewRequired ? "required" : "not required"}</span></div><div><b>Detected pattern/category</b><span>${report.detectedPattern}</span></div><div><b>Proposed next action</b><span>${report.proposedNextAction}</span></div></div><h4>Warnings</h4><ul>${report.warnings.map(w=>`<li class="warning">${w}</li>`).join("") || "<li>none</li>"}</ul><h4>Rationale</h4><ul>${report.rationale.map(r=>`<li>${r}</li>`).join("")}</ul><h4>Proposed queue jobs</h4>${report.proposedJobs.length ? `<table><thead><tr><th>Run</th><th>Baseline</th><th>Candidates</th><th>Generations</th><th>Depth</th><th>Games</th><th>Seeds</th><th>Mutation</th><th>Openings</th><th>Rationale</th></tr></thead><tbody>${report.proposedJobs.map(j=>`<tr><td>${j.runName}</td><td>${j.baselineProfileId}</td><td>${j.candidateCount}</td><td>${j.generations}</td><td>${j.searchDepth}</td><td>${j.gamesPerMatchup}</td><td>${j.seedCount} @ ${j.seedStart}</td><td>${j.mutationRate}/${j.mutationMagnitude}; elites ${j.eliteCount}; ${j.parentSelection}</td><td>${j.openingSuite.join(", ")}</td><td>${j.rationale}</td></tr>`).join("")}</tbody></table>` : "<p>No jobs proposed.</p>"}<details><summary>Planner report JSON</summary><pre>${JSON.stringify(report, null, 2)}</pre></details>`;
+}
+async function analyzePlannerUi(): Promise<void> {
+  const baseline = val("tune-baseline") || "production-baseline-v1";
+  currentPlannerReport = await tuningStore.analyzeTuningPlanner(baseline);
+  document.querySelector("#planner-dashboard")!.innerHTML = plannerReportHtml(currentPlannerReport);
+  (document.querySelector<HTMLButtonElement>("#planner-generate")!).disabled = false;
+  (document.querySelector<HTMLButtonElement>("#planner-export")!).disabled = false;
+  (document.querySelector<HTMLButtonElement>("#planner-add")!).disabled = true;
+}
+async function generatePlannerUi(): Promise<void> {
+  await analyzePlannerUi();
+  if (currentPlannerReport?.proposedJobs.length) (document.querySelector<HTMLButtonElement>("#planner-add")!).disabled = false;
+}
+async function addPlannerJobsUi(): Promise<void> {
+  if (!currentPlannerReport) await analyzePlannerUi();
+  if (!currentPlannerReport) return;
+  try { const added = await tuningStore.addPlannerJobsToQueue(currentPlannerReport); setDownloadFeedback(`Added ${added.length} Phase 5 planner job(s). Queue remains paused.`); await renderQueue(`Added ${added.length} Phase 5 planner job(s). Queue remains paused until Start queue is clicked.`); }
+  catch (err) { setDownloadFeedback(`Planner add failed: ${err instanceof Error ? err.message : String(err)}`, true); }
+}
+async function exportPlannerUi(): Promise<void> {
+  if (!currentPlannerReport) await analyzePlannerUi();
+  if (!currentPlannerReport) return;
+  const files = plannerReportExportFiles(currentPlannerReport);
+  triggerDownloadZip(`phase5-planner-report.zip`, files);
+}
+
 function queuePresetName(): "Small validation"|"Broad search"|"Confirmation" { return (document.querySelector<HTMLSelectElement>("#queue-preset")?.value ?? "Small validation") as any; }
 function loadQueuePreset(): void { try { const name = queuePresetName(); const baseline = val("tune-baseline") || "production-baseline-v1"; const settings = tuningQueuePreset(name, baseline); applyTuningSettingsToEditor(settings); (document.querySelector<HTMLInputElement>("#queue-name")!).value = name; setDownloadFeedback(`Preset loaded into editor: ${name}.`); } catch (err) { setDownloadFeedback(`Preset load failed: ${err instanceof Error ? err.message : String(err)}`, true); } }
 async function addQueueJob(): Promise<void> { if (!queueInitialized) { setDownloadFeedback("Job add failed: queue is still loading.", true); return; } try { const settings = currentTuningSettings(); const runName = (document.querySelector<HTMLInputElement>("#queue-name")?.value || settings.name).trim(); const item = await tuningStore.enqueueTuningJob(runName, settings.baselineProfileId, { ...settings, name: runName, autoPauseAfterGeneration: false }); await renderQueue(`Job added: ${runName} (${item.queueItemId}).`); setDownloadFeedback(`Job added: ${runName} (${item.queueItemId}).`); } catch (err) { setDownloadFeedback(`Job add failed: ${err instanceof Error ? err.message : String(err)}`, true); await renderQueue(`Job add failed: ${err instanceof Error ? err.message : String(err)}`); } }
