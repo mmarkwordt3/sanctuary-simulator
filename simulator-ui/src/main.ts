@@ -9,7 +9,7 @@ import type { ExperimentWorkerResponse } from "./experiment-worker.ts";
 import type { RunResult } from "./simulation-runner.ts";
 import type { WorkerRequest, WorkerResponse } from "./worker.ts";
 import { acceptanceTuningSettings, DEFAULT_MIRRORED_OPENING_SUITE } from "../../simulator/tuning.ts";
-import { TuningStore, tuningMatchProgressLabel, tuningQueuePreset, plannerReportExportFiles, type BackupPreview, type TuningPlannerReport, type TuningQueueItem, type TuningSnapshot } from "./tuning-store.ts";
+import { TuningStore, tuningMatchProgressLabel, tuningQueuePreset, plannerReportExportFiles, baselineDiagnosticsExportFiles, type BackupPreview, type TuningPlannerReport, type BaselineDiagnosticsReport, type TuningQueueItem, type TuningSnapshot } from "./tuning-store.ts";
 import "./styles.css";
 
 const experimentStore = new ExperimentStore();
@@ -18,6 +18,7 @@ let activeExperimentRun: { experimentId: string; pauseRequested: boolean; cancel
 let activeQueueRun: { worker: Worker | null; running: boolean; cancelRequested: boolean } | null = null;
 let queueInitialized = false;
 let currentPlannerReport: TuningPlannerReport | null = null;
+let currentBaselineDiagnosticsReport: BaselineDiagnosticsReport | null = null;
 let pendingBackupImport: unknown | null = null;
 let currentExperimentView: { experimentId: string; page: number; pageSize: number; query: GameQuery; replayTimer: number | null; replayPly: number } | null = null;
 const state: { settings: SimulatorUiSettings; worker: Worker | null; result: RunResult | null; startedAt: number; paused: boolean } = {
@@ -52,6 +53,7 @@ I1-H1</textarea></label><p id="tune-estimate"></p><button id="tune-create">Creat
     <section class="card"><h2>10. Phase 4 / Tuning Queue</h2><p class="warning">Automated queue runs one tuning match at a time while this browser tab remains open and awake. It survives reloads, recovers running tuning runs, and never auto-promotes candidates; eligible candidates are marked Manual review required.</p><div class="grid"><label>Queue preset<select id="queue-preset"><option>Small validation</option><option>Broad search</option><option>Confirmation</option></select></label><label>Queue run name<input id="queue-name" value="Small validation"></label></div><p class="warning">Choose/edit baseline and tuning settings in the Evolutionary Tuning panel above, or load a preset here before adding it to the queue.</p><div class="advanced-actions"><button id="queue-load-preset" disabled>Load preset into editor</button><button id="queue-add" disabled>Add edited job to queue</button><button id="queue-start" disabled>Start queue</button><button id="queue-pause-match" disabled>Pause after current match</button><button id="queue-pause-run" disabled>Pause after current run</button><button id="queue-resume" disabled>Resume queue</button></div><div id="queue-dashboard">Loading queue…</div></section>
     <section class="card"><h2>11. Phase 5 / Automated Tuning Planner</h2><p class="warning">The planner analyzes completed tuning history and drafts Phase 4 queue jobs only. It never auto-promotes candidates and never starts the queue.</p><div class="advanced-actions"><button id="planner-analyze">Analyze tuning history</button><button id="planner-generate" disabled>Generate proposed queue</button><button id="planner-add" disabled>Add proposed jobs to Phase 4 queue</button><button id="planner-export" disabled>Export planner report</button></div><div id="planner-dashboard">No planner analysis yet.</div></section>
     <section class="card"><h2>12. Phase 6 / Backup and Restore</h2><p class="warning">Export a full local JSON backup before moving computers. Import replace mode overwrites this browser's local IndexedDB data only after preview and explicit confirmation; queues remain paused and nothing is approved, promoted, or auto-started.</p><div class="advanced-actions"><button id="backup-export">Export full local data backup</button><button id="backup-choose">Import local data backup</button><button id="backup-validate" disabled>Validate backup file</button><button id="backup-confirm" disabled>Confirm replace import</button><input id="backup-file" type="file" accept="application/json,.json" class="hidden"></div><div id="backup-preview">No backup selected.</div></section>
+    <section class="card"><h2>12.5. Phase 6.5 / Baseline Champion Diagnostics</h2><p class="warning">Analyze completed tuning history to explain why the selected baseline remains champion. Suggested jobs are drafts only; adding them keeps the Phase 4 queue paused, with no auto-promotion and no auto-start.</p><div class="advanced-actions"><button id="diag-analyze">Analyze baseline champion history</button><button id="diag-export" disabled>Export diagnostics report</button><button id="diag-add" disabled>Add suggested jobs to Phase 4 queue</button></div><div id="diag-dashboard">No baseline champion diagnostics yet.</div></section>
     <section class="card"><h2>13. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
   </div><aside class="run-panel" aria-label="Run controls"><h2>Run Simulation</h2><button id="start">Start</button><button id="pause" disabled>Pause</button><button id="resume" disabled>Resume</button><button id="cancel" disabled>Cancel</button><button id="reset">Reset</button><div class="mini-progress"><progress id="sticky-bar" value="0" max="100"></progress><div id="sticky-progress-text">No run started.</div></div></aside></main>`;
 
@@ -150,6 +152,9 @@ function wireEvents(): void {
   document.querySelector("#planner-add")!.addEventListener("click", addPlannerJobsUi);
   document.querySelector("#planner-export")!.addEventListener("click", exportPlannerUi);
   document.querySelector("#backup-export")!.addEventListener("click", exportLocalBackupUi);
+  document.querySelector("#diag-analyze")!.addEventListener("click", analyzeDiagnosticsUi);
+  document.querySelector("#diag-export")!.addEventListener("click", exportDiagnosticsUi);
+  document.querySelector("#diag-add")!.addEventListener("click", addDiagnosticsJobsUi);
   document.querySelector("#backup-choose")!.addEventListener("click", () => document.querySelector<HTMLInputElement>("#backup-file")!.click());
   document.querySelector("#backup-validate")!.addEventListener("click", validateSelectedBackupUi);
   document.querySelector("#backup-confirm")!.addEventListener("click", importBackupReplaceUi);
@@ -653,6 +658,28 @@ async function exportPlannerUi(): Promise<void> {
   if (!currentPlannerReport) return;
   const files = plannerReportExportFiles(currentPlannerReport);
   triggerDownloadZip(`phase5-planner-report.zip`, files);
+}
+
+
+function diagnosticsReportHtml(report: BaselineDiagnosticsReport): string {
+  return `<div class="metrics"><div><b>Completed runs analyzed</b><span>${report.summary.completedRunsAnalyzed}</span></div><div><b>Baseline champion runs</b><span>${report.summary.baselineChampionRuns}</span></div><div><b>Conclusion</b><span>${report.conclusion.category} (${report.conclusion.confidence})</span></div><div><b>Recommended next experiment</b><span>${report.conclusion.recommendedNextExperiment}</span></div><div><b>Safety</b><span>No auto-start: ${report.safety.noAutoStart}; no auto-promotion: ${report.safety.noAutoPromotion}; queue paused: ${report.safety.queueRemainsPaused}</span></div></div><p>${report.conclusion.rationale}</p><h4>Warnings</h4><ul>${report.summary.warnings.map(w=>`<li class="warning">${w}</li>`).join("") || "<li>none</li>"}</ul><h4>Per-run diagnostics</h4><table><thead><tr><th>Run</th><th>ID</th><th>Baseline</th><th>Final best</th><th>Champion baseline?</th><th>Recommendation</th><th>Matches</th><th>Openings</th></tr></thead><tbody>${report.perRun.map(r=>`<tr><td>${r.runName}</td><td>${r.runId}</td><td>${r.selectedBaselineProfileId ?? ""}</td><td>${r.finalGenerationBestCandidateId ?? ""}</td><td>${r.championIsBaseline}</td><td>${r.recommendation}</td><td>${r.completedMatchCount}/${r.totalMatchCount}; failed ${r.failedMatchCount}</td><td>${r.openingsUsed.join(", ")}</td></tr>`).join("")}</tbody></table><h4>Suggested Phase 4 queue jobs</h4><p class="warning">Jobs are added only if you click Add suggested jobs; the queue remains paused.</p><ul>${report.suggestedJobs.map(j=>`<li>${j.runName}: ${j.rationale}</li>`).join("")}</ul><details><summary>Diagnostics JSON</summary><pre>${JSON.stringify(report, null, 2)}</pre></details>`;
+}
+async function analyzeDiagnosticsUi(): Promise<void> {
+  currentBaselineDiagnosticsReport = await tuningStore.analyzeBaselineChampionDiagnostics();
+  document.querySelector("#diag-dashboard")!.innerHTML = diagnosticsReportHtml(currentBaselineDiagnosticsReport);
+  (document.querySelector<HTMLButtonElement>("#diag-export")!).disabled = false;
+  (document.querySelector<HTMLButtonElement>("#diag-add")!).disabled = currentBaselineDiagnosticsReport.suggestedJobs.length === 0;
+}
+async function exportDiagnosticsUi(): Promise<void> {
+  if (!currentBaselineDiagnosticsReport) await analyzeDiagnosticsUi();
+  if (!currentBaselineDiagnosticsReport) return;
+  triggerDownloadZip("phase6-5-baseline-diagnostics.zip", baselineDiagnosticsExportFiles(currentBaselineDiagnosticsReport));
+}
+async function addDiagnosticsJobsUi(): Promise<void> {
+  if (!currentBaselineDiagnosticsReport) await analyzeDiagnosticsUi();
+  if (!currentBaselineDiagnosticsReport) return;
+  try { const added = await tuningStore.addBaselineDiagnosticJobsToQueue(currentBaselineDiagnosticsReport); setDownloadFeedback(`Added ${added.length} Phase 6.5 diagnostic job(s). Queue remains paused.`); await renderQueue(`Added ${added.length} Phase 6.5 diagnostic job(s). Queue remains paused until Start queue is clicked.`); }
+  catch (err) { setDownloadFeedback(`Diagnostics add failed: ${err instanceof Error ? err.message : String(err)}`, true); }
 }
 
 function queuePresetName(): "Small validation"|"Broad search"|"Confirmation" { return (document.querySelector<HTMLSelectElement>("#queue-preset")?.value ?? "Small validation") as any; }
