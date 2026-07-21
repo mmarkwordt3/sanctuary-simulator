@@ -58,6 +58,12 @@ export interface ApprovedExperimentalProfileMetadata { sourceTuningRunId: string
 export type ApprovedEvaluationProfile = EvaluationProfile & { experimentalApproval: ApprovedExperimentalProfileMetadata };
 
 const STORES = ["evaluationProfiles", "tuningRuns", "tuningCandidates", "tuningMatches", "tuningGenerations", "promotionReports", "tuningQueue", "tuningQueueState", "tuningQueueExports"];
+const BACKUP_STORES = ["experiments", "gameJobs", "completedGames", "experimentAnalyses", "analysisFlags", "followUpProposals", ...STORES] as const;
+export const LOCAL_BACKUP_FORMAT = "sanctuary-simulator-local-backup";
+export const LOCAL_BACKUP_SCHEMA_VERSION = 1;
+export type BackupStoreName = typeof BACKUP_STORES[number];
+export type LocalBackup = { format: typeof LOCAL_BACKUP_FORMAT; schemaVersion: number; createdAt: string; exportedAt: string; app: { dbName: string; dbSchemaVersion: number; tunerVersion: string }; stores: Record<BackupStoreName, unknown[]>; };
+export interface BackupPreview { schemaVersion: number; exportedAt: string; profileCount: number; approvedProfileCount: number; tuningRunCount: number; queueItemCount: number; matchRecordCount: number; plannerReportCount: number; experimentCount: number; completedGameCount: number; stores: Record<string, number>; }
 function now() { return new Date().toISOString(); }
 function id(prefix: string) { return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; }
 function generationKey(tuningRunId: string, generation: number) { return `${tuningRunId}-generation-${generation}`; }
@@ -96,6 +102,7 @@ function openDb(name = EXPERIMENT_DB_NAME): Promise<IDBDatabase> {
 function txDone(tx: IDBTransaction, body: (tx: IDBTransaction) => void) { return new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error); body(tx); }); }
 function get<T>(db: IDBDatabase, store: string, key: IDBValidKey) { return new Promise<T | undefined>((resolve, reject) => { const r = db.transaction(store).objectStore(store).get(key); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); }); }
 function getAll<T>(db: IDBDatabase, store: string) { return new Promise<T[]>((resolve, reject) => { const r = db.transaction(store).objectStore(store).getAll(); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); }); }
+function clearStore(tx: IDBTransaction, store: string) { const st = tx.objectStore(store); if (typeof (st as any).clear === "function") (st as any).clear(); else st.openCursor().onsuccess = (e) => { const cursor = (e.target as IDBRequest<IDBCursorWithValue>).result; if (cursor) { cursor.delete(); cursor.continue(); } }; }
 
 export function openingPrefix(label: string): Move[] {
   const initial = createInitialState();
@@ -437,6 +444,61 @@ export class TuningStore {
     return added;
   }
   async exportPlannerReport(report: TuningPlannerReport): Promise<ExportFile[]> { return plannerReportExportFiles(report); }
+
+  async exportLocalBackup(): Promise<LocalBackup> {
+    for (const run of await this.listTuningRuns()) if (run.status === "completed") await this.reconcileTuningRun(run.tuningRunId);
+    const db = await this.db(); const stores = {} as Record<BackupStoreName, unknown[]>;
+    for (const store of BACKUP_STORES) stores[store] = await getAll(db, store);
+    const stamp = now();
+    return { format: LOCAL_BACKUP_FORMAT, schemaVersion: LOCAL_BACKUP_SCHEMA_VERSION, createdAt: stamp, exportedAt: stamp, app: { dbName: EXPERIMENT_DB_NAME, dbSchemaVersion: EXPERIMENT_SCHEMA_VERSION, tunerVersion: TUNER_VERSION }, stores };
+  }
+
+  validateLocalBackup(value: unknown): { backup: LocalBackup; preview: BackupPreview } {
+    if (!value || typeof value !== "object") throw new Error("Backup file is not a JSON object.");
+    const backup = value as LocalBackup;
+    if (backup.format !== LOCAL_BACKUP_FORMAT) throw new Error("Backup format is not supported.");
+    if (!Number.isInteger(backup.schemaVersion)) throw new Error("Backup schemaVersion is missing or invalid.");
+    if (backup.schemaVersion > LOCAL_BACKUP_SCHEMA_VERSION) throw new Error(`Backup schema ${backup.schemaVersion} is newer than this app supports (${LOCAL_BACKUP_SCHEMA_VERSION}).`);
+    if (!backup.stores || typeof backup.stores !== "object") throw new Error("Backup stores are missing.");
+    for (const store of BACKUP_STORES) if (!Array.isArray(backup.stores[store])) throw new Error(`Backup store ${store} is missing or invalid.`);
+    for (const p of backup.stores.evaluationProfiles as any[]) if (!p.profileId || !p.weights) throw new Error("Backup contains an invalid evaluation profile.");
+    for (const r of backup.stores.tuningRuns as any[]) if (!r.tuningRunId || !r.baselineProfileId || !r.status) throw new Error("Backup contains an invalid tuning run.");
+    for (const m of backup.stores.tuningMatches as any[]) if (!m.matchId || !m.tuningRunId || !m.status) throw new Error("Backup contains an invalid tuning match.");
+    for (const q of backup.stores.tuningQueue as any[]) if (!q.queueItemId || !q.status) throw new Error("Backup contains an invalid queue item.");
+    const preview: BackupPreview = {
+      schemaVersion: backup.schemaVersion,
+      exportedAt: backup.exportedAt ?? backup.createdAt,
+      profileCount: backup.stores.evaluationProfiles.length,
+      approvedProfileCount: (backup.stores.evaluationProfiles as any[]).filter((p) => p.source === "promotion" && p.promoted === true && p.experimentalApproval?.status === "approved-experimental").length,
+      tuningRunCount: backup.stores.tuningRuns.length,
+      queueItemCount: backup.stores.tuningQueue.length,
+      matchRecordCount: backup.stores.tuningMatches.length,
+      plannerReportCount: backup.stores.followUpProposals.length + (backup.stores.tuningQueue as any[]).filter((q) => q.runName?.includes("Phase 5")).length,
+      experimentCount: backup.stores.experiments.length,
+      completedGameCount: backup.stores.completedGames.length,
+      stores: Object.fromEntries(BACKUP_STORES.map((s) => [s, backup.stores[s].length])),
+    };
+    return { backup, preview };
+  }
+
+  previewLocalBackup(value: unknown): BackupPreview { return this.validateLocalBackup(value).preview; }
+
+  async importLocalBackupReplace(value: unknown): Promise<BackupPreview> {
+    const { backup, preview } = this.validateLocalBackup(value);
+    const db = await this.db(); const stamp = now();
+    const sanitized = { ...backup.stores };
+    sanitized.tuningRuns = (sanitized.tuningRuns as any[]).map((r) => r.status === "running" ? { ...r, status: "paused", currentWorkerState: "interrupted", currentMatchId: null, activeStartedAt: null, updatedAt: stamp } : { ...r, currentWorkerState: "idle", currentMatchId: null, activeStartedAt: null });
+    sanitized.tuningMatches = (sanitized.tuningMatches as any[]).map((m) => m.status === "running" ? { ...m, status: "queued", startedAt: null } : m);
+    sanitized.tuningQueue = (sanitized.tuningQueue as any[]).map((q) => q.status === "running" ? { ...q, status: "queued", startedAt: null, errorMessage: "Paused by backup import; start explicitly to resume." } : q);
+    sanitized.tuningQueueState = [{ stateId: "singleton", autoRunEnabled: false, pauseAfterCurrentMatch: false, pauseAfterCurrentRun: false, activeQueueItemId: null, updatedAt: stamp, message: "Imported backup. Queue is paused until explicitly started." }];
+    sanitized.experiments = (sanitized.experiments as any[]).map((e) => e.status === "running" ? { ...e, status: "paused", runningJobs: 0, currentJobId: null, activeStartedAt: null, updatedAt: stamp } : e);
+    sanitized.gameJobs = (sanitized.gameJobs as any[]).map((j) => j.status === "running" ? { ...j, status: "queued", startedAt: null } : j);
+    await txDone(db.transaction([...BACKUP_STORES], "readwrite"), (tx) => { for (const s of BACKUP_STORES) clearStore(tx, s); for (const s of BACKUP_STORES) for (const row of sanitized[s]) tx.objectStore(s).put(row); });
+    for (const run of await this.listTuningRuns()) await this.reconcileTuningRun(run.tuningRunId);
+    for (const item of await this.listQueueItems()) await this.syncQueueItemFromRun(item.queueItemId);
+    await this.saveQueueState({ autoRunEnabled: false, activeQueueItemId: null, message: "Imported backup. Queue is paused until explicitly started." });
+    return preview;
+  }
 
   private async putQueueItem(item: TuningQueueItem) { const db=await this.db(); await txDone(db.transaction(["tuningQueue"],"readwrite"), tx=>tx.objectStore("tuningQueue").put(item)); }
 
