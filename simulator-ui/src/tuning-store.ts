@@ -52,6 +52,7 @@ export interface TuningRunRecord extends TuningRunSettings {
 }
 
 export interface TuningSnapshot { run: TuningRunRecord; profiles: EvaluationProfile[]; candidates: TuningCandidate[]; matches: TuningMatch[]; generations: TuningGeneration[]; reports: PromotionReport[]; }
+export interface TuningReconciliation { completedMatches: number; failedMatches: number; totalMatches: number; unresolvedMatches: number; settled: boolean; }
 
 export interface ApprovedExperimentalProfileMetadata { sourceTuningRunId: string; sourceCandidateId: string; approvedAt: string; parentOrBaselineProfileId: string; evaluationWeights: EvaluationProfile["weights"]; status: "approved-experimental"; }
 export type ApprovedEvaluationProfile = EvaluationProfile & { experimentalApproval: ApprovedExperimentalProfileMetadata };
@@ -167,12 +168,29 @@ export class TuningStore {
     const db = await this.db();
     const run = await get<TuningRunRecord>(db, "tuningRuns", tuningRunId);
     if (!run) return null;
-    const [profiles, candidates, matches, generations, reports] = await Promise.all([
+    let [profiles, candidates, matches, generations, reports] = await Promise.all([
       getAll<EvaluationProfile>(db, "evaluationProfiles"), getAll<TuningCandidate>(db, "tuningCandidates"), getAll<TuningMatch>(db, "tuningMatches"), getAll<TuningGeneration & { generationKey: string }>(db, "tuningGenerations"), getAll<PromotionReport>(db, "promotionReports"),
     ]);
+    matches = matches.filter((m) => m.tuningRunId === tuningRunId);
+    const reconciliation = reconcileCounts(matches);
+    let effectiveRun = run;
+    if (run.status === "completed" && needsCountReconciliation(run, reconciliation)) effectiveRun = await this.persistReconciledRun(run, reconciliation);
     const profileIds = new Set(candidates.filter((c) => c.tuningRunId === tuningRunId).map((c) => c.profileId));
-    profileIds.add(run.baselineProfileId);
-    return { run, profiles: profiles.filter((p) => profileIds.has(p.profileId)), candidates: candidates.filter((c) => c.tuningRunId === tuningRunId), matches: matches.filter((m) => m.tuningRunId === tuningRunId), generations: generations.filter((g) => g.tuningRunId === tuningRunId), reports: reports.filter((r) => r.tuningRunId === tuningRunId) };
+    profileIds.add(effectiveRun.baselineProfileId);
+    return { run: effectiveRun, profiles: profiles.filter((p) => profileIds.has(p.profileId)), candidates: candidates.filter((c) => c.tuningRunId === tuningRunId), matches, generations: generations.filter((g) => g.tuningRunId === tuningRunId), reports: reports.filter((r) => r.tuningRunId === tuningRunId) };
+  }
+  async reconcileTuningRun(tuningRunId: string): Promise<TuningSnapshot | null> {
+    const snap = await this.loadTuningRun(tuningRunId); if (!snap) return null;
+    const reconciliation = reconcileCounts(snap.matches);
+    if (!needsCountReconciliation(snap.run, reconciliation)) return snap;
+    const run = await this.persistReconciledRun(snap.run, reconciliation);
+    return { ...snap, run };
+  }
+  private async persistReconciledRun(run: TuningRunRecord, reconciliation: TuningReconciliation): Promise<TuningRunRecord> {
+    const updated: TuningRunRecord = { ...run, completedMatches: reconciliation.completedMatches, failedMatches: reconciliation.failedMatches, totalMatches: reconciliation.totalMatches, updatedAt: now() };
+    const db = await this.db();
+    await txDone(db.transaction(["tuningRuns"], "readwrite"), (tx) => tx.objectStore("tuningRuns").put(updated));
+    return updated;
   }
   async nextQueuedMatch(tuningRunId: string) { const snap = await this.loadTuningRun(tuningRunId); return snap?.matches.filter((m) => m.status === "queued" && m.fixture === snap.run.currentPhase).sort((a, b) => a.generation - b.generation || a.matchId.localeCompare(b.matchId))[0] ?? null; }
   async resumeTuningRun(tuningRunId: string) { return this.setRunStatus(tuningRunId, "running"); }
@@ -217,7 +235,7 @@ export class TuningStore {
       for (const p of snap.profiles.filter((p) => p.source !== "promotion" && p.profileId !== snap.run.baselineProfileId && p.profileId !== PRODUCTION_PROFILE_ID)) tx.objectStore("evaluationProfiles").delete(p.profileId);
     });
   }
-  async exportTuningRun(tuningRunId: string): Promise<ExportFile[]> { const snap = await this.loadTuningRun(tuningRunId); if (!snap) throw new Error("Tuning run not found"); return tuningExportFiles(snap.run, snap.profiles, snap.candidates, snap.matches, snap.generations, snap.reports[0] ?? null) as ExportFile[]; }
+  async exportTuningRun(tuningRunId: string): Promise<ExportFile[]> { const snap = await this.reconcileTuningRun(tuningRunId); if (!snap) throw new Error("Tuning run not found"); return tuningExportFiles(snap.run, snap.profiles, snap.candidates, snap.matches, snap.generations, snap.reports[0] ?? null) as ExportFile[]; }
   async approveCandidate(tuningRunId: string, candidateId: string) {
     const snap = await this.loadTuningRun(tuningRunId); if (!snap) throw new Error("Tuning run not found");
     const candidate = snap.candidates.find((c) => c.candidateId === candidateId); if (!candidate) throw new Error("Candidate not found");
@@ -317,9 +335,11 @@ export class TuningStore {
           });
           for (const c of withFinalPhaseScores) tx.objectStore("tuningCandidates").put(c);
           candidates = candidates.map((c) => withFinalPhaseScores.find((s) => s.candidateId === c.candidateId) ?? c);
-          const report = buildPromotionReport(run, candidates, matches);
-          if (report) { tx.objectStore("promotionReports").put(report); run.bestCandidateId = report.overallChampionCandidateId ?? null; run.overallChampionCandidateId = report.overallChampionCandidateId ?? null; run.overallChampionProfileId = report.overallChampionProfileId ?? null; run.overallChampionGeneration = report.overallChampionGeneration ?? null; run.overallChampionIsSelectedBaseline = !!report.overallChampionIsSelectedBaseline; run.finalGenerationBestCandidateId = report.finalGenerationBestCandidateId ?? null; run.selectedBaselineProfileId = report.selectedBaselineProfileId ?? run.baselineProfileId; run.promotionCandidateId = report.promotionCandidateId ?? null; }
-          run.status = "completed"; run.currentPhase = "complete"; run.completedAt = completedAt;
+          const finalReconciliation = reconcileCounts(matches);
+          run.completedMatches = finalReconciliation.completedMatches; run.failedMatches = finalReconciliation.failedMatches; run.totalMatches = finalReconciliation.totalMatches;
+          const report = finalReconciliation.settled ? buildPromotionReport(run, candidates, matches) : null;
+          if (!finalReconciliation.settled) { run.status = "queued"; run.currentWorkerState = "idle"; }
+          if (report) { tx.objectStore("promotionReports").put(report); run.bestCandidateId = report.overallChampionCandidateId ?? null; run.overallChampionCandidateId = report.overallChampionCandidateId ?? null; run.overallChampionProfileId = report.overallChampionProfileId ?? null; run.overallChampionGeneration = report.overallChampionGeneration ?? null; run.overallChampionIsSelectedBaseline = !!report.overallChampionIsSelectedBaseline; run.finalGenerationBestCandidateId = report.finalGenerationBestCandidateId ?? null; run.selectedBaselineProfileId = report.selectedBaselineProfileId ?? run.baselineProfileId; run.promotionCandidateId = report.promotionCandidateId ?? null; run.status = "completed"; run.currentPhase = "complete"; run.completedAt = completedAt; }
         }
       }
       tx.objectStore("tuningRuns").put(run);
@@ -371,9 +391,13 @@ export class TuningStore {
   }
   async syncQueueItemFromRun(queueItemId: string): Promise<TuningQueueItem|null> {
     const item = await this.getQueueItem(queueItemId); if (!item?.tuningRunId) return item ?? null;
-    const snap = await this.loadTuningRun(item.tuningRunId); if (!snap) return item;
+    const snap = await this.reconcileTuningRun(item.tuningRunId); if (!snap) return item;
     const patch: Partial<TuningQueueItem> = {};
-    if (snap.run.status === "completed") Object.assign(patch, { status: "completed" as const, completedAt: snap.run.completedAt ?? now(), summary: summarizeQueueRun(snap) });
+    const reconciliation = reconcileCounts(snap.matches);
+    if (snap.run.status === "completed") {
+      if (!reconciliation.settled) Object.assign(patch, { status: "failed" as const, completedAt: now(), errorMessage: `Tuning run has ${reconciliation.unresolvedMatches} unresolved matches after reconciliation.`, autoExportStatus: "not-ready" as const, summary: summarizeQueueRun(snap) });
+      else Object.assign(patch, { status: "completed" as const, completedAt: snap.run.completedAt ?? now(), summary: summarizeQueueRun(snap) });
+    }
     if (snap.run.status === "failed" || snap.run.status === "cancelled") Object.assign(patch, { status: snap.run.status as "failed"|"cancelled", completedAt: now(), errorMessage: snap.run.status });
     if (Object.keys(patch).length) { const updated = { ...item, ...patch }; await this.putQueueItem(updated); return updated; }
     return item;
@@ -381,13 +405,14 @@ export class TuningStore {
   async failQueueItem(queueItemId: string, errorMessage: string) { const item = await this.getQueueItem(queueItemId); if (!item) return; await this.putQueueItem({ ...item, status: "failed", completedAt: now(), errorMessage }); await this.saveQueueState({ message: `Queue job failed: ${errorMessage}` }); }
   async autoExportQueueItem(queueItemId: string): Promise<void> {
     const item = await this.getQueueItem(queueItemId); if (!item?.tuningRunId) return;
-    try { const files = await this.exportTuningRun(item.tuningRunId); const promotion = files.filter(f=>f.name === "promotion_report.md" || f.name === "promotion_report.json"); const stamp = now(); const records: TuningQueueExportRecord[] = [{ recordId: `${queueItemId}-full`, queueItemId, tuningRunId: item.tuningRunId, kind: "full-tuning-export", filename: `${item.tuningRunId}-tuning-export.zip`, files, createdAt: stamp }, { recordId: `${queueItemId}-promotion`, queueItemId, tuningRunId: item.tuningRunId, kind: "promotion-report", filename: `${item.tuningRunId}-promotion-report.zip`, files: promotion, createdAt: stamp }]; const db=await this.db(); await txDone(db.transaction(["tuningQueueExports","tuningQueue"],"readwrite"), tx=>{ for(const r of records) tx.objectStore("tuningQueueExports").put(r); tx.objectStore("tuningQueue").put({ ...item, autoExportStatus: "succeeded", autoExportError: null }); }); }
+    try { const snap = await this.reconcileTuningRun(item.tuningRunId); if (!snap || snap.run.status !== "completed" || !reconcileCounts(snap.matches).settled) throw new Error("Tuning run is not reconciled and ready for export."); const files = await this.exportTuningRun(item.tuningRunId); const promotion = files.filter(f=>f.name === "promotion_report.md" || f.name === "promotion_report.json"); const stamp = now(); const records: TuningQueueExportRecord[] = [{ recordId: `${queueItemId}-full`, queueItemId, tuningRunId: item.tuningRunId, kind: "full-tuning-export", filename: `${item.tuningRunId}-tuning-export.zip`, files, createdAt: stamp }, { recordId: `${queueItemId}-promotion`, queueItemId, tuningRunId: item.tuningRunId, kind: "promotion-report", filename: `${item.tuningRunId}-promotion-report.zip`, files: promotion, createdAt: stamp }]; const db=await this.db(); await txDone(db.transaction(["tuningQueueExports","tuningQueue"],"readwrite"), tx=>{ for(const r of records) tx.objectStore("tuningQueueExports").put(r); tx.objectStore("tuningQueue").put({ ...item, autoExportStatus: "succeeded", autoExportError: null }); }); }
     catch(err) { await this.putQueueItem({ ...item, autoExportStatus: "failed", autoExportError: err instanceof Error ? err.message : String(err) }); }
   }
   async listQueueExportRecords(queueItemId?: string): Promise<TuningQueueExportRecord[]> { const all = await getAll<TuningQueueExportRecord>(await this.db(), "tuningQueueExports"); return queueItemId ? all.filter(r=>r.queueItemId===queueItemId) : all; }
   async recoverQueueAfterReload(): Promise<TuningQueueState> {
     await this.recoverInterruptedTuningRuns();
-    for (const item of await this.listQueueItems()) if (item.status === "running") await this.syncQueueItemFromRun(item.queueItemId);
+    for (const run of await this.listTuningRuns()) if (run.status === "completed") await this.reconcileTuningRun(run.tuningRunId);
+    for (const item of await this.listQueueItems()) if (item.status === "running" || item.status === "completed") await this.syncQueueItemFromRun(item.queueItemId);
     const state = await this.getQueueState();
     return state.autoRunEnabled ? this.saveQueueState({ message: "Queue recovered after reload; auto-run is enabled." }) : this.saveQueueState({ message: "Queue recovered after reload. Use Resume queue to continue." });
   }
@@ -408,6 +433,16 @@ export class TuningStore {
     });
   }
 }
+
+export function reconcileCounts(matches: TuningMatch[]): TuningReconciliation {
+  const completedMatches = matches.filter((m) => m.status === "completed").length;
+  const failedMatches = matches.filter((m) => m.status === "failed").length;
+  const totalMatches = matches.length;
+  const unresolvedMatches = matches.filter((m) => m.status === "queued" || m.status === "running").length;
+  return { completedMatches, failedMatches, totalMatches, unresolvedMatches, settled: completedMatches + failedMatches >= totalMatches };
+}
+export function needsCountReconciliation(run: TuningRunRecord, reconciliation: TuningReconciliation): boolean { return run.completedMatches !== reconciliation.completedMatches || run.failedMatches !== reconciliation.failedMatches || run.totalMatches !== reconciliation.totalMatches; }
+export function tuningMatchProgressLabel(run: Pick<TuningRunRecord, "completedMatches" | "failedMatches" | "totalMatches" | "status">): string { const unresolved = Math.max(0, run.totalMatches - run.completedMatches - run.failedMatches); return unresolved && run.status === "completed" ? `${run.completedMatches}/${run.totalMatches}, ${unresolved} unresolved` : `${run.completedMatches}/${run.totalMatches}`; }
 
 export function scheduleFinalistMatches(tuningRunId: string, generation: number, finalists: TuningCandidate[], settings: TuningRunSettings, fixture: "validation" | "holdout"): TuningMatch[] {
   const seedSet = fixture === "validation" ? settings.antiOverfitSettings.validationSeeds : settings.antiOverfitSettings.holdoutSeeds;

@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { productionEvaluationProfile } from "../../simulator/evaluation-profiles.ts";
 import { acceptanceTuningSettings } from "../../simulator/tuning.ts";
 import { ExperimentStore } from "../src/experiments.ts";
-import { TuningStore } from "../src/tuning-store.ts";
+import { TuningStore, tuningMatchProgressLabel } from "../src/tuning-store.ts";
 import { installIndexedDbShim } from "./indexeddb-shim.ts";
 
 installIndexedDbShim();
@@ -328,4 +328,64 @@ describe("positive recommendation smoke coverage", () => {
     expect(records.find(r => r.kind === "promotion-report")!.files.find(f => f.name === "promotion_report.json")!.content).toContain("eligible for manual promotion");
     expect(records.find(r => r.kind === "full-tuning-export")!.files.find(f => f.name === "promotion_report.md")!.content).toContain("No candidate is automatically promoted");
   }, 30000);
+});
+
+
+describe("tuning count reconciliation regressions", () => {
+  async function finishRun(store: TuningStore, runId: string) {
+    for (let guard = 0; guard < 100; guard++) {
+      const snap = (await store.loadTuningRun(runId))!;
+      if (snap.run.status === "completed") return snap;
+      const match = await store.nextQueuedMatch(runId);
+      if (!match) continue;
+      await store.markMatchRunning(runId, match.matchId);
+      await store.completeMatch(runId, match.matchId, { result: guard % 2 ? "blue" : "green", plies: 8, drawReason: null, diagnostics: { illegalMoves: 0, uniquePositionsVisited: 6 }, replayOk: true });
+    }
+    throw new Error("run did not finish");
+  }
+  async function overwriteRun(store: TuningStore, run: any) {
+    const db = await store.db();
+    await new Promise<void>((resolve, reject) => { const tx = db.transaction(["tuningRuns"], "readwrite"); tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.objectStore("tuningRuns").put(run); });
+  }
+
+  it("reconciles stale completed metadata from persisted match records on reload and export", async () => {
+    const name = dbName();
+    let store = new TuningStore(name);
+    const run = await store.createTuningRun(quickSettings());
+    const final = await finishRun(store, run.tuningRunId);
+    await overwriteRun(store, { ...final.run, completedMatches: final.run.completedMatches - 3, totalMatches: final.run.totalMatches });
+    store.close();
+
+    store = new TuningStore(name);
+    await store.recoverQueueAfterReload();
+    const recovered = (await store.loadTuningRun(run.tuningRunId))!;
+    expect(recovered.run.completedMatches).toBe(recovered.matches.filter(m => m.status === "completed").length);
+    expect(recovered.run.completedMatches).toBe(recovered.run.totalMatches);
+    expect(tuningMatchProgressLabel(recovered.run)).toBe(`${recovered.run.totalMatches}/${recovered.run.totalMatches}`);
+
+    const files = await store.exportTuningRun(run.tuningRunId);
+    const metadata = JSON.parse(files.find(f => f.name === "tuning_run_metadata.json")!.content);
+    const summary = JSON.parse(files.find(f => f.name === "tuning_summary.json")!.content);
+    const matchRows = files.find(f => f.name === "matches.csv")!.content.trim().split("\n").length - 1;
+    expect(metadata.completedMatches).toBe(summary.completedMatches);
+    expect(summary.completedMatches).toBe(matchRows);
+    expect(files.find(f => f.name === "failed_matches.csv")!.content).toBe("");
+  }, 30000);
+
+  it("does not mark queue completed or auto-export when completed run has unresolved matches", async () => {
+    const store = new TuningStore(dbName());
+    const settings = quickSettings();
+    const item = await store.enqueueTuningJob("unresolved", settings.baselineProfileId, settings);
+    const run = await store.createRunForQueueItem(item.queueItemId);
+    const snap = (await store.loadTuningRun(run.tuningRunId))!;
+    await overwriteRun(store, { ...snap.run, status: "completed", currentPhase: "complete", completedMatches: 0, failedMatches: 0, totalMatches: snap.matches.length, completedAt: new Date().toISOString() });
+
+    const queued = (await store.syncQueueItemFromRun(item.queueItemId))!;
+    expect(queued.status).toBe("failed");
+    expect(queued.errorMessage).toContain("unresolved matches");
+    expect(tuningMatchProgressLabel((await store.loadTuningRun(run.tuningRunId))!.run)).toContain("unresolved");
+    await store.autoExportQueueItem(item.queueItemId);
+    expect((await store.getQueueItem(item.queueItemId))!.autoExportStatus).toBe("failed");
+    expect(await store.listQueueExportRecords(item.queueItemId)).toHaveLength(0);
+  });
 });
