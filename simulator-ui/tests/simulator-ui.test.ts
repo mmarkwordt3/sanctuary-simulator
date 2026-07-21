@@ -147,6 +147,15 @@ describe("simulator UI layout", () => {
     expect(main).toContain("Queue remains paused");
   });
 
+  it("documents Phase 6 backup and restore controls and safety copy", () => {
+    const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    expect(main).toContain("12. Phase 6 / Backup and Restore");
+    for (const id of ["#backup-export", "#backup-choose", "#backup-validate", "#backup-confirm", "#backup-preview"]) expect(main).toContain(id);
+    expect(main).toContain("overwrites this browser's local IndexedDB data");
+    expect(main).toContain("Queue is paused");
+    expect(main).toContain("nothing is approved, promoted, or auto-started");
+  });
+
   it("documents positive manual-review recommendation UI fields for Section 9 and Phase 4 queue", () => {
     const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     expect(main).toContain("Champion is baseline");

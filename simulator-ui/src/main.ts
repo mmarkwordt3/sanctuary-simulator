@@ -9,7 +9,7 @@ import type { ExperimentWorkerResponse } from "./experiment-worker.ts";
 import type { RunResult } from "./simulation-runner.ts";
 import type { WorkerRequest, WorkerResponse } from "./worker.ts";
 import { acceptanceTuningSettings, DEFAULT_MIRRORED_OPENING_SUITE } from "../../simulator/tuning.ts";
-import { TuningStore, tuningMatchProgressLabel, tuningQueuePreset, plannerReportExportFiles, type TuningPlannerReport, type TuningQueueItem, type TuningSnapshot } from "./tuning-store.ts";
+import { TuningStore, tuningMatchProgressLabel, tuningQueuePreset, plannerReportExportFiles, type BackupPreview, type TuningPlannerReport, type TuningQueueItem, type TuningSnapshot } from "./tuning-store.ts";
 import "./styles.css";
 
 const experimentStore = new ExperimentStore();
@@ -18,6 +18,7 @@ let activeExperimentRun: { experimentId: string; pauseRequested: boolean; cancel
 let activeQueueRun: { worker: Worker | null; running: boolean; cancelRequested: boolean } | null = null;
 let queueInitialized = false;
 let currentPlannerReport: TuningPlannerReport | null = null;
+let pendingBackupImport: unknown | null = null;
 let currentExperimentView: { experimentId: string; page: number; pageSize: number; query: GameQuery; replayTimer: number | null; replayPly: number } | null = null;
 const state: { settings: SimulatorUiSettings; worker: Worker | null; result: RunResult | null; startedAt: number; paused: boolean } = {
   settings: structuredClone(DEFAULT_SETTINGS),
@@ -50,7 +51,8 @@ I1-H1</textarea></label><p id="tune-estimate"></p><button id="tune-create">Creat
 
     <section class="card"><h2>10. Phase 4 / Tuning Queue</h2><p class="warning">Automated queue runs one tuning match at a time while this browser tab remains open and awake. It survives reloads, recovers running tuning runs, and never auto-promotes candidates; eligible candidates are marked Manual review required.</p><div class="grid"><label>Queue preset<select id="queue-preset"><option>Small validation</option><option>Broad search</option><option>Confirmation</option></select></label><label>Queue run name<input id="queue-name" value="Small validation"></label></div><p class="warning">Choose/edit baseline and tuning settings in the Evolutionary Tuning panel above, or load a preset here before adding it to the queue.</p><div class="advanced-actions"><button id="queue-load-preset" disabled>Load preset into editor</button><button id="queue-add" disabled>Add edited job to queue</button><button id="queue-start" disabled>Start queue</button><button id="queue-pause-match" disabled>Pause after current match</button><button id="queue-pause-run" disabled>Pause after current run</button><button id="queue-resume" disabled>Resume queue</button></div><div id="queue-dashboard">Loading queue…</div></section>
     <section class="card"><h2>11. Phase 5 / Automated Tuning Planner</h2><p class="warning">The planner analyzes completed tuning history and drafts Phase 4 queue jobs only. It never auto-promotes candidates and never starts the queue.</p><div class="advanced-actions"><button id="planner-analyze">Analyze tuning history</button><button id="planner-generate" disabled>Generate proposed queue</button><button id="planner-add" disabled>Add proposed jobs to Phase 4 queue</button><button id="planner-export" disabled>Export planner report</button></div><div id="planner-dashboard">No planner analysis yet.</div></section>
-    <section class="card"><h2>12. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
+    <section class="card"><h2>12. Phase 6 / Backup and Restore</h2><p class="warning">Export a full local JSON backup before moving computers. Import replace mode overwrites this browser's local IndexedDB data only after preview and explicit confirmation; queues remain paused and nothing is approved, promoted, or auto-started.</p><div class="advanced-actions"><button id="backup-export">Export full local data backup</button><button id="backup-choose">Import local data backup</button><button id="backup-validate" disabled>Validate backup file</button><button id="backup-confirm" disabled>Confirm replace import</button><input id="backup-file" type="file" accept="application/json,.json" class="hidden"></div><div id="backup-preview">No backup selected.</div></section>
+    <section class="card"><h2>13. Help</h2><ul><li><b>Deterministic</b> agents always choose the top evaluated move for a seed.</li><li><b>Diverse</b> agents choose among near-best legal moves.</li><li><b>Search</b> agents look ahead by depth; higher depth is slower.</li><li><b>Seeds</b> make runs reproducible.</li><li><b>Maximum plies</b> ends games that run too long.</li></ul></section>
   </div><aside class="run-panel" aria-label="Run controls"><h2>Run Simulation</h2><button id="start">Start</button><button id="pause" disabled>Pause</button><button id="resume" disabled>Resume</button><button id="cancel" disabled>Cancel</button><button id="reset">Reset</button><div class="mini-progress"><progress id="sticky-bar" value="0" max="100"></progress><div id="sticky-progress-text">No run started.</div></div></aside></main>`;
 
 renderForms();
@@ -147,6 +149,11 @@ function wireEvents(): void {
   document.querySelector("#planner-generate")!.addEventListener("click", generatePlannerUi);
   document.querySelector("#planner-add")!.addEventListener("click", addPlannerJobsUi);
   document.querySelector("#planner-export")!.addEventListener("click", exportPlannerUi);
+  document.querySelector("#backup-export")!.addEventListener("click", exportLocalBackupUi);
+  document.querySelector("#backup-choose")!.addEventListener("click", () => document.querySelector<HTMLInputElement>("#backup-file")!.click());
+  document.querySelector("#backup-validate")!.addEventListener("click", validateSelectedBackupUi);
+  document.querySelector("#backup-confirm")!.addEventListener("click", importBackupReplaceUi);
+  document.querySelector("#backup-file")!.addEventListener("change", validateSelectedBackupUi);
   document.querySelector("#experiment-dashboard")!.addEventListener("click", experimentAction);
   document.querySelector("#experiment-detail")!.addEventListener("click", experimentDetailAction);
   document.querySelector("#experiment-detail")!.addEventListener("change", experimentDetailChanged);
@@ -238,6 +245,45 @@ function renderDownloads(files: ExportFile[]): void {
 
 function download(file: ExportFile): void { setDownloadFeedback(`Downloaded ${triggerDownloadFile(file).filename}.`); }
 function setDownloadFeedback(message: string, error = false): void { const el = document.querySelector("#downloads"); if (el) el.insertAdjacentHTML("afterbegin", `<p class="${error ? "warning" : "success"}">${message}</p>`); const tuning = document.querySelector("#tune-profile-info"); if (tuning) tuning.textContent = message; }
+async function exportLocalBackupUi(): Promise<void> {
+  try {
+    const backup = await tuningStore.exportLocalBackup();
+    const file = { name: `sanctuary-local-backup-${backup.exportedAt.slice(0, 10)}.json`, mime: "application/json", content: JSON.stringify(backup, null, 2) };
+    const result = triggerDownloadFile(file);
+    renderBackupMessage(`Downloaded ${result.filename}. Keep this file private; it contains full local simulator history.`, false);
+  } catch (err) { renderBackupMessage(err instanceof Error ? err.message : String(err), true); }
+}
+async function readSelectedBackupFile(): Promise<unknown> {
+  const file = document.querySelector<HTMLInputElement>("#backup-file")!.files?.[0];
+  if (!file) throw new Error("Choose a backup JSON file first.");
+  return JSON.parse(await file.text());
+}
+async function validateSelectedBackupUi(): Promise<void> {
+  try {
+    pendingBackupImport = await readSelectedBackupFile();
+    const preview = tuningStore.previewLocalBackup(pendingBackupImport);
+    renderBackupPreview(preview);
+    document.querySelector<HTMLButtonElement>("#backup-validate")!.disabled = false;
+    document.querySelector<HTMLButtonElement>("#backup-confirm")!.disabled = false;
+  } catch (err) {
+    pendingBackupImport = null;
+    document.querySelector<HTMLButtonElement>("#backup-confirm")!.disabled = true;
+    renderBackupMessage(`Backup validation failed: ${err instanceof Error ? err.message : String(err)}`, true);
+  }
+}
+async function importBackupReplaceUi(): Promise<void> {
+  try {
+    if (!pendingBackupImport) throw new Error("Validate a backup before importing.");
+    if (!confirm("Replace this browser's local simulator data with the validated backup? Export your current local backup first if you need it. Queues will remain paused.")) return;
+    const preview = await tuningStore.importLocalBackupReplace(pendingBackupImport);
+    await refreshBaselineDropdown(); await renderTuningRuns(); await renderQueue("Imported backup. Queue remains paused until you explicitly start it."); await renderExperiments(); currentPlannerReport = null;
+    renderBackupPreview(preview, "Import complete. Approved baselines, tuning runs, queue history, planner/experiment history, and exports were restored. Queue is paused.");
+  } catch (err) { renderBackupMessage(`Import failed: ${err instanceof Error ? err.message : String(err)}`, true); }
+}
+function renderBackupPreview(p: BackupPreview, message = "Backup is valid. Review the contents, then confirm replace import if this is the file you want."): void {
+  document.querySelector("#backup-preview")!.innerHTML = `<p class="success">${message}</p><p class="warning">Replace import will overwrite local browser data. Export current local backup first if needed.</p><div class="metrics"><div><b>Profiles</b><span>${p.profileCount}</span></div><div><b>Approved profiles</b><span>${p.approvedProfileCount}</span></div><div><b>Tuning runs</b><span>${p.tuningRunCount}</span></div><div><b>Queue items</b><span>${p.queueItemCount}</span></div><div><b>Match records</b><span>${p.matchRecordCount}</span></div><div><b>Planner records</b><span>${p.plannerReportCount}</span></div><div><b>Experiments</b><span>${p.experimentCount}</span></div><div><b>Completed games</b><span>${p.completedGameCount}</span></div><div><b>Backup timestamp</b><span>${p.exportedAt}</span></div><div><b>Schema version</b><span>${p.schemaVersion}</span></div></div>`;
+}
+function renderBackupMessage(message: string, error = false): void { document.querySelector("#backup-preview")!.innerHTML = `<p class="${error ? "warning" : "success"}">${message}</p>`; }
 function input(label: string, id: string, value: number, type: string, title: string): string { return `<label title="${title}">${label}<input id="${id}" type="${type}" value="${value}"></label>`; }
 function checkbox(label: string, id: string, value: boolean): string { return `<label>${label}<input id="${id}" type="checkbox" ${value ? "checked" : ""}></label>`; }
 function selectAgent(label: string, id: string, value: AgentName): string { return select(label, id, value, AGENT_CHOICES); }
